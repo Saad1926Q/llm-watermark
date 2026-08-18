@@ -2,7 +2,12 @@
 
 import torch
 
-from src.watermark import CONTEXT_WIDTH, TOURNAMENT_LAYERS, sample_watermarked_token
+from src.watermark import (
+    CONTEXT_WIDTH,
+    TOURNAMENT_LAYERS,
+    sample_normally,
+    sample_watermarked_token,
+)
 
 
 def encode_prompt(tokenizer, prompt: str):
@@ -87,21 +92,33 @@ def generate_watermarked_text(
     eos_token_id = tokenizer.eos_token_id
     fill_token_id = eos_token_id if eos_token_id is not None else 0
 
+    seen_contexts: set[tuple[int, ...]] = set()
+
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             # Only the final logits row predicts the next token.
             next_logits = model(input_ids=input_ids).logits[0, -1, :]
 
             context = _context_tokens(input_ids, fill_token_id)
+            context_key = tuple(context)
+            is_repeated_context = context_key in seen_contexts
+            seen_contexts.add(context_key)
 
-            next_token_id = sample_watermarked_token(
-                next_logits,
-                context,
-                key,
-                temperature=temperature,
-                top_p=top_p,
-                layers=layers,
-            )
+            if is_repeated_context:
+                next_token_id = sample_normally(
+                    next_logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+            else:
+                next_token_id = sample_watermarked_token(
+                    next_logits,
+                    context,
+                    key,
+                    temperature=temperature,
+                    top_p=top_p,
+                    layers=layers,
+                )
 
             next_token = torch.tensor(
                 [[next_token_id]],

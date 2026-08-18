@@ -137,11 +137,32 @@ def _sampling_probabilities(
         top_p=top_p,
         min_tokens_to_keep=1,
     )
+
     filtered_scores = warper(input_ids, scores)
 
     # Remove the artificial batch dimension before converting scores
     # into probabilities for torch.multinomial().
     return torch.softmax(filtered_scores.squeeze(0), dim=-1)
+
+
+def sample_normally(
+    logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+) -> int:
+    """Sample one token from the filtered model distribution without watermarking.
+
+    Args:
+        logits: One-dimensional next-token logits.
+        temperature: Sampling temperature.
+        top_p: Nucleus sampling threshold.
+
+    Returns:
+        The sampled token ID.
+    """
+    probabilities = _sampling_probabilities(logits, temperature, top_p)
+    return int(torch.multinomial(probabilities, 1).item())
 
 
 def sample_watermarked_token(
