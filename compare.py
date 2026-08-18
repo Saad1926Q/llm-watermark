@@ -152,6 +152,10 @@ def main() -> None:
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument(
+        "--device-map",
+        help='Transformers device map, such as "auto"; requires Accelerate',
+    )
 
     args = parser.parse_args()
 
@@ -165,17 +169,25 @@ def main() -> None:
     key = load_key(args.key_path)
     wrong_key = _different_key(key)
 
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
-
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-    )
+    if args.device_map is not None:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            dtype="auto",
+            device_map=args.device_map,
+        )
+    else:
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
 
-    model.to(device)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            dtype=dtype,
+        )
+        model.to(device)
+
     model.eval()
+    input_device = torch.device(str(model.get_input_embeddings().weight.device))
 
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -190,7 +202,7 @@ def main() -> None:
                 model,
                 tokenizer,
                 prompt,
-                device=device,
+                device=input_device,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,
@@ -206,7 +218,7 @@ def main() -> None:
                 tokenizer,
                 prompt,
                 key,
-                device=device,
+                device=input_device,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,

@@ -78,3 +78,21 @@ watermarked sampling:
 Detection only needs the text, tokenizer, key, and watermark configuration - not the language model. A correct key should produce an elevated score for watermarked text, while ordinary text or a wrong key should remain near the random baseline.
 
 This provides statistical evidence that text is consistent with the key; it is not proof of authorship.
+
+## Qwen3-14B FP8
+
+Run the comparison with Qwen's official FP8 checkpoint using automatic model placement:
+
+```bash
+uv run compare.py \
+    --model Qwen/Qwen3-14B-FP8 \
+    --device-map auto \
+    --output-file outputs/qwen3-14b-fp8.jsonl \
+    --max-new-tokens 1024 \
+    --temperature 0.7 \
+    --top-p 0.8
+```
+
+Use a recent NVIDIA GPU with approximately 24 GB of VRAM. Automatic placement also works
+with unquantized checkpoints. The checkpoint determines its numerical format; `--device-map`
+only controls where Transformers places the model.
