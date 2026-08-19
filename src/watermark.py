@@ -165,6 +165,8 @@ def _sampling_probabilities(
     logits: torch.Tensor,
     temperature: float,
     top_p: float,
+    *,
+    warper: TopPLogitsWarper | None = None,
 ) -> torch.Tensor:
     """Apply temperature and top-p filtering to a logits vector.
 
@@ -201,10 +203,11 @@ def _sampling_probabilities(
         device=logits.device,
     )
 
-    warper = TopPLogitsWarper(
-        top_p=top_p,
-        min_tokens_to_keep=1,
-    )
+    if warper is None:
+        warper = TopPLogitsWarper(
+            top_p=top_p,
+            min_tokens_to_keep=1,
+        )
 
     filtered_scores = warper(input_ids, scores)
 
@@ -218,6 +221,7 @@ def sample_normally(
     *,
     temperature: float = 1.0,
     top_p: float = 1.0,
+    _warper: TopPLogitsWarper | None = None,
 ) -> int:
     """Sample one token from the filtered model distribution without watermarking.
 
@@ -229,7 +233,12 @@ def sample_normally(
     Returns:
         The sampled token ID.
     """
-    probabilities = _sampling_probabilities(logits, temperature, top_p)
+    probabilities = _sampling_probabilities(
+        logits,
+        temperature,
+        top_p,
+        warper=_warper,
+    )
     return int(torch.multinomial(probabilities, 1).item())
 
 
@@ -241,6 +250,7 @@ def sample_watermarked_token(
     temperature: float = 1.0,
     top_p: float = 1.0,
     layers: int = TOURNAMENT_LAYERS,
+    _warper: TopPLogitsWarper | None = None,
 ) -> int:
     """Sample one token using keyed tournament sampling.
 
@@ -263,7 +273,12 @@ def sample_watermarked_token(
     context = _normalize_context(context_tokens)
     _validate_layers(layers)
 
-    probabilities = _sampling_probabilities(logits, temperature, top_p)
+    probabilities = _sampling_probabilities(
+        logits,
+        temperature,
+        top_p,
+        warper=_warper,
+    )
 
     candidate_count = 1 << layers
 

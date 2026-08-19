@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from transformers.generation.logits_process import TopPLogitsWarper
 
 from src.watermark import (
     CONTEXT_WIDTH,
@@ -135,7 +136,8 @@ def generate_watermarked(
         Generated IDs and decoded generated continuation.
 
     Raises:
-        ValueError: If ``max_new_tokens`` is negative or sampler inputs are invalid.
+        ValueError: If ``max_new_tokens`` is negative or the model does not
+            return a KV cache.
     """
     if max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative")
@@ -144,18 +146,42 @@ def generate_watermarked(
     input_ids = encoded["input_ids"].to(device)
     generated_token_ids: list[int] = []
 
+    if max_new_tokens == 0:
+        text = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        return GenerationResult(generated_token_ids, text)
+
+    attention_mask = encoded.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        attention_mask = attention_mask.to(device)
+
     eos_token_id = tokenizer.eos_token_id
     seen_contexts: set[tuple[int, ...]] = set()
+    warper = TopPLogitsWarper(
+        top_p=top_p,
+        min_tokens_to_keep=1,
+    )
 
     with torch.inference_mode():
-        for _ in range(max_new_tokens):
-            next_logits = model(input_ids=input_ids).logits[0, -1, :]
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+        past_key_values = getattr(outputs, "past_key_values", None)
+        if past_key_values is None:
+            raise ValueError("model did not return past_key_values with use_cache=True")
+
+        for step in range(max_new_tokens):
+            next_logits = outputs.logits[0, -1, :]
 
             if len(generated_token_ids) < CONTEXT_WIDTH:
                 next_token_id = sample_normally(
                     next_logits,
                     temperature=temperature,
                     top_p=top_p,
+                    _warper=warper,
                 )
             else:
                 context = generated_token_ids[-CONTEXT_WIDTH:]
@@ -168,6 +194,7 @@ def generate_watermarked(
                         next_logits,
                         temperature=temperature,
                         top_p=top_p,
+                        _warper=warper,
                     )
                 else:
                     next_token_id = sample_watermarked_token(
@@ -177,18 +204,41 @@ def generate_watermarked(
                         temperature=temperature,
                         top_p=top_p,
                         layers=layers,
+                        _warper=warper,
                     )
+
+            generated_token_ids.append(next_token_id)
+
+            if eos_token_id is not None and next_token_id == eos_token_id:
+                break
+            if step == max_new_tokens - 1:
+                break
 
             next_token = torch.tensor(
                 [[next_token_id]],
                 dtype=input_ids.dtype,
                 device=device,
             )
-            input_ids = torch.cat((input_ids, next_token), dim=1)
-            generated_token_ids.append(next_token_id)
-
-            if eos_token_id is not None and next_token_id == eos_token_id:
-                break
+            attention_mask = torch.cat(
+                (
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        dtype=attention_mask.dtype,
+                        device=device,
+                    ),
+                ),
+                dim=1,
+            )
+            outputs = model(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = getattr(outputs, "past_key_values", None)
+            if past_key_values is None:
+                raise ValueError("model did not return past_key_values with use_cache=True")
 
     text = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
     return GenerationResult(generated_token_ids, text)
