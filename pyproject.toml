@@ -5,14 +5,22 @@ build-backend = "hatchling.build"
 [project]
 name = "llm-watermark"
 version = "0.1.0"
-description = "Add your description here"
+description = "Minimal SynthID-style watermark generation, calibration, and detection"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "accelerate>=1.10.0",
+    "datasets>=3.0.0",
     "torch>=2.11.0",
     "transformers>=4.57.0",
 ]
+
+[project.scripts]
+generate-key = "scripts.generate_key:main"
+generate-data = "scripts.generate_data:main"
+fit-threshold = "scripts.fit_threshold:main"
+evaluate-watermark = "scripts.evaluate:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8",
@@ -35,7 +43,7 @@ quote-style = "double"
 
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src", "scripts"]
 
 [tool.uv.sources]
 torch = [

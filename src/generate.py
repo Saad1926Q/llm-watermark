@@ -1,5 +1,10 @@
 """Manual autoregressive generation with the keyed watermark sampler."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 
 from src.watermark import (
@@ -10,7 +15,20 @@ from src.watermark import (
 )
 
 
-def encode_prompt(tokenizer, prompt: str):
+@dataclass(frozen=True)
+class GenerationResult:
+    """Token-exact result from one autoregressive generation call.
+
+    Attributes:
+        generated_token_ids: Exact token IDs appended by generation.
+        text: Decoded generated continuation, excluding the prompt.
+    """
+
+    generated_token_ids: list[int]
+    text: str
+
+
+def encode_prompt(tokenizer: Any, prompt: str) -> Any:
     """Tokenize a prompt, applying the tokenizer's chat template when available.
 
     Args:
@@ -31,27 +49,61 @@ def encode_prompt(tokenizer, prompt: str):
     return tokenizer(prompt, return_tensors="pt")
 
 
-def _context_tokens(input_ids: torch.Tensor, fill_token_id: int) -> list[int]:
-    """Return the latest context tokens, left-padding short prompts.
+def generate_normal(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    *,
+    device: torch.device,
+    max_new_tokens: int = 1024,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+) -> GenerationResult:
+    """Generate an ordinary stochastic continuation and preserve exact IDs.
 
     Args:
-        input_ids: A batch containing the tokenized input sequence.
-        fill_token_id: Token ID used to left-pad short sequences.
+        model: Evaluation-mode causal language model.
+        tokenizer: Tokenizer corresponding to ``model``.
+        prompt: Text to use as the generation prefix.
+        device: Device on which model inputs are stored.
+        max_new_tokens: Maximum number of tokens to append to ``prompt``.
+        temperature: Sampling temperature passed to Transformers.
+        top_p: Nucleus sampling threshold passed to Transformers.
 
     Returns:
-        Exactly ``CONTEXT_WIDTH`` token IDs for watermark sampling.
+        Generated IDs and decoded generated continuation.
+
+    Raises:
+        ValueError: If ``max_new_tokens`` is negative.
     """
-    token_ids = input_ids[0].tolist()
-    if len(token_ids) >= CONTEXT_WIDTH:
-        return token_ids[-CONTEXT_WIDTH:]
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative")
 
-    padding = [fill_token_id] * (CONTEXT_WIDTH - len(token_ids))
-    return padding + token_ids
+    encoded = encode_prompt(tokenizer, prompt)
+    input_ids = encoded["input_ids"].to(device)
+
+    generation_kwargs: dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": True,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
+    if tokenizer.eos_token_id is not None:
+        generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
+
+    with torch.inference_mode():
+        output_ids = model.generate(input_ids=input_ids, **generation_kwargs)
+
+    generated_token_ids = [
+        int(token_id) for token_id in output_ids[0, input_ids.shape[1] :].tolist()
+    ]
+    text = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    return GenerationResult(generated_token_ids, text)
 
 
-def generate_watermarked_text(
-    model,
-    tokenizer,
+def generate_watermarked(
+    model: Any,
+    tokenizer: Any,
     prompt: str,
     key: bytes,
     *,
@@ -60,8 +112,13 @@ def generate_watermarked_text(
     temperature: float = 1.0,
     top_p: float = 0.95,
     layers: int = TOURNAMENT_LAYERS,
-) -> str:
-    """Generate one watermarked continuation with manual token sampling.
+) -> GenerationResult:
+    """Generate a response-only watermarked continuation and preserve exact IDs.
+
+    The first ``CONTEXT_WIDTH`` response tokens are sampled normally so they
+    establish a response context. Subsequent tokens use only the generated
+    response suffix as context. A context is sampled normally if it repeats
+    within this response, matching the detector's repeated-context masking.
 
     Args:
         model: Evaluation-mode causal language model returning next-token logits.
@@ -75,62 +132,63 @@ def generate_watermarked_text(
         layers: Number of keyed tournament-sampling layers.
 
     Returns:
-        The decoded generated continuation, excluding the prompt.
+        Generated IDs and decoded generated continuation.
 
     Raises:
-        ValueError: If ``max_new_tokens`` is negative or sampler inputs are
-            invalid.
+        ValueError: If ``max_new_tokens`` is negative or sampler inputs are invalid.
     """
     if max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative")
 
     encoded = encode_prompt(tokenizer, prompt)
     input_ids = encoded["input_ids"].to(device)
-
-    prompt_length = input_ids.shape[1]
+    generated_token_ids: list[int] = []
 
     eos_token_id = tokenizer.eos_token_id
-    fill_token_id = eos_token_id if eos_token_id is not None else 0
-
     seen_contexts: set[tuple[int, ...]] = set()
 
     with torch.inference_mode():
         for _ in range(max_new_tokens):
-            # Only the final logits row predicts the next token.
             next_logits = model(input_ids=input_ids).logits[0, -1, :]
 
-            context = _context_tokens(input_ids, fill_token_id)
-            context_key = tuple(context)
-            is_repeated_context = context_key in seen_contexts
-            seen_contexts.add(context_key)
-
-            if is_repeated_context:
+            if len(generated_token_ids) < CONTEXT_WIDTH:
                 next_token_id = sample_normally(
                     next_logits,
                     temperature=temperature,
                     top_p=top_p,
                 )
             else:
-                next_token_id = sample_watermarked_token(
-                    next_logits,
-                    context,
-                    key,
-                    temperature=temperature,
-                    top_p=top_p,
-                    layers=layers,
-                )
+                context = generated_token_ids[-CONTEXT_WIDTH:]
+                context_key = tuple(context)
+                is_repeated_context = context_key in seen_contexts
+                seen_contexts.add(context_key)
+
+                if is_repeated_context:
+                    next_token_id = sample_normally(
+                        next_logits,
+                        temperature=temperature,
+                        top_p=top_p,
+                    )
+                else:
+                    next_token_id = sample_watermarked_token(
+                        next_logits,
+                        context,
+                        key,
+                        temperature=temperature,
+                        top_p=top_p,
+                        layers=layers,
+                    )
 
             next_token = torch.tensor(
                 [[next_token_id]],
                 dtype=input_ids.dtype,
                 device=device,
             )
-
             input_ids = torch.cat((input_ids, next_token), dim=1)
+            generated_token_ids.append(next_token_id)
 
             if eos_token_id is not None and next_token_id == eos_token_id:
                 break
 
-    generated_ids = input_ids[0, prompt_length:]
-
-    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+    text = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    return GenerationResult(generated_token_ids, text)

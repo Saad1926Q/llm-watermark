@@ -2,12 +2,23 @@ import argparse
 import secrets
 from pathlib import Path
 
-KEY_SIZE_BYTES = 32
-DEFAULT_KEY_PATH = Path(__file__).parent / "keys" / "watermark.key"
+from src.watermark import DEFAULT_KEY_PATH, KEY_SIZE_BYTES
 
 
 def generate_key(path: Path = DEFAULT_KEY_PATH, overwrite: bool = False) -> None:
-    """Generate and save a 256-bit watermark key."""
+    """Generate and save a cryptographically random 256-bit watermark key.
+
+    Args:
+        path: Destination path for the raw key bytes.
+        overwrite: Whether to replace an existing key file.
+
+    Returns:
+        None.
+
+    Raises:
+        FileExistsError: If the destination exists and ``overwrite`` is false.
+        OSError: If the key cannot be written or its permissions changed.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
 
     mode = "wb" if overwrite else "xb"
@@ -18,7 +29,12 @@ def generate_key(path: Path = DEFAULT_KEY_PATH, overwrite: bool = False) -> None
     path.chmod(0o600)
 
 
-def main():
+def main() -> None:
+    """Parse key-generation options and write the default key.
+
+    Returns:
+        None.
+    """
     parser = argparse.ArgumentParser(description="Generate the watermark secret key.")
     parser.add_argument(
         "--force",

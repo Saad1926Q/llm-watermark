@@ -7,7 +7,6 @@ statistical pattern without loading the language model.
 from __future__ import annotations
 
 import hashlib
-import math
 import struct
 from collections.abc import Sequence
 from pathlib import Path
@@ -24,6 +23,17 @@ _UINT32_MAX = 2**32 - 1
 
 
 def _validate_key(key: bytes) -> None:
+    """Validate that a key contains the required number of raw bytes.
+
+    Args:
+        key: Raw watermark key bytes.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If ``key`` is not exactly ``KEY_SIZE_BYTES`` bytes.
+    """
     if len(key) != KEY_SIZE_BYTES:
         raise ValueError(f"watermark key must be {KEY_SIZE_BYTES} bytes, got {len(key)} bytes")
 
@@ -48,6 +58,18 @@ def load_key(path: Path = DEFAULT_KEY_PATH) -> bytes:
 
 
 def _as_uint32(value: int, name: str) -> int:
+    """Convert a value to an unsigned 32-bit integer.
+
+    Args:
+        value: Integer-like value to normalize.
+        name: Human-readable name used in validation errors.
+
+    Returns:
+        The normalized integer.
+
+    Raises:
+        ValueError: If the value is outside the unsigned 32-bit range.
+    """
     value = int(value)
     if not 0 <= value <= _UINT32_MAX:
         raise ValueError(f"{name} must be between 0 and {_UINT32_MAX}, got {value}")
@@ -55,6 +77,17 @@ def _as_uint32(value: int, name: str) -> int:
 
 
 def _normalize_context(context_tokens: Sequence[int]) -> tuple[int, ...]:
+    """Validate and normalize a fixed-width watermark context.
+
+    Args:
+        context_tokens: Context token IDs to normalize.
+
+    Returns:
+        The context as a tuple of unsigned 32-bit token IDs.
+
+    Raises:
+        ValueError: If the context width or token IDs are invalid.
+    """
     if len(context_tokens) != CONTEXT_WIDTH:
         raise ValueError(
             f"watermark context must contain {CONTEXT_WIDTH} tokens, got {len(context_tokens)}"
@@ -63,6 +96,17 @@ def _normalize_context(context_tokens: Sequence[int]) -> tuple[int, ...]:
 
 
 def _validate_layers(layers: int) -> None:
+    """Validate the number of tournament layers.
+
+    Args:
+        layers: Number of tournament layers.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If ``layers`` is less than one.
+    """
     if layers < 1:
         raise ValueError(f"layers must be at least 1, got {layers}")
 
@@ -73,6 +117,17 @@ def _watermark_bit_from_context(
     layer: int,
     token_id: int,
 ) -> int:
+    """Compute one keyed watermark bit for a normalized candidate token.
+
+    Args:
+        key: Secret watermark key.
+        context_tokens: Validated fixed-width context token IDs.
+        layer: Tournament layer number.
+        token_id: Candidate or observed token ID.
+
+    Returns:
+        A deterministic bit, either ``0`` or ``1``.
+    """
     payload = struct.pack(">6I", *context_tokens, layer, token_id)
     digest = hashlib.blake2b(payload, key=key, digest_size=8).digest()
     return digest[0] & 1
@@ -111,6 +166,19 @@ def _sampling_probabilities(
     temperature: float,
     top_p: float,
 ) -> torch.Tensor:
+    """Apply temperature and top-p filtering to a logits vector.
+
+    Args:
+        logits: One-dimensional next-token logits.
+        temperature: Positive sampling temperature.
+        top_p: Nucleus sampling threshold in ``(0, 1]``.
+
+    Returns:
+        A one-dimensional probability tensor over the vocabulary.
+
+    Raises:
+        ValueError: If the logits shape or sampling parameters are invalid.
+    """
     if logits.ndim != 1:
         raise ValueError(f"logits must be one-dimensional, got shape {tuple(logits.shape)}")
     if logits.numel() == 0:
@@ -259,7 +327,7 @@ def score_tokens(
     key: bytes,
     *,
     layers: int = TOURNAMENT_LAYERS,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Count keyed watermark bits in a token sequence.
 
     Args:
@@ -268,47 +336,31 @@ def score_tokens(
         layers: Number of watermark bits scored per token.
 
     Returns:
-        A ``(ones, total_bits)`` tuple. The first four tokens are skipped.
+        A ``(ones, total_bits, scored_contexts)`` tuple. The first four tokens
+        are skipped, and repeated contexts contribute no additional bits.
 
     Raises:
         ValueError: If the key, token IDs, or layer count is invalid.
     """
-
     _validate_key(key)
     _validate_layers(layers)
     tokens = tuple(_as_uint32(token_id, "token ID") for token_id in token_ids)
 
     ones = 0
     total_bits = 0
+    scored_contexts = 0
+    seen_contexts: set[tuple[int, ...]] = set()
+
     for position in range(CONTEXT_WIDTH, len(tokens)):
         context = tokens[position - CONTEXT_WIDTH : position]
+        if context in seen_contexts:
+            continue
+
+        seen_contexts.add(context)
         token_id = tokens[position]
         for layer in range(layers):
             ones += _watermark_bit_from_context(key, context, layer, token_id)
             total_bits += 1
+        scored_contexts += 1
 
-    return ones, total_bits
-
-
-def calculate_statistics(ones: int, total_bits: int) -> tuple[float, float, float]:
-    """Return approximate statistics under a 0.5-bit null model.
-
-    Args:
-        ones: Number of observed watermark bits equal to one.
-        total_bits: Total number of scored watermark bits.
-
-    Returns:
-        A ``(score, z_score, p_value)`` tuple.
-
-    Raises:
-        ValueError: If the counts cannot describe a non-empty bit sequence.
-    """
-    if total_bits <= 0:
-        raise ValueError("at least one scored watermark bit is required")
-    if not 0 <= ones <= total_bits:
-        raise ValueError(f"ones must be between 0 and {total_bits}, got {ones}")
-
-    score = ones / total_bits
-    z_score = (ones - total_bits / 2) / math.sqrt(total_bits / 4)
-    p_value = 0.5 * math.erfc(z_score / math.sqrt(2))
-    return score, z_score, p_value
+    return ones, total_bits, scored_contexts
