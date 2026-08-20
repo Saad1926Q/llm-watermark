@@ -222,6 +222,7 @@ def sample_normally(
     temperature: float = 1.0,
     top_p: float = 1.0,
     _warper: TopPLogitsWarper | None = None,
+    _generator: torch.Generator | None = None,
 ) -> int:
     """Sample one token from the filtered model distribution without watermarking.
 
@@ -239,7 +240,9 @@ def sample_normally(
         top_p,
         warper=_warper,
     )
-    return int(torch.multinomial(probabilities, 1).item())
+    if _generator is None:
+        return int(torch.multinomial(probabilities, 1).item())
+    return int(torch.multinomial(probabilities, 1, generator=_generator).item())
 
 
 def sample_watermarked_token(
@@ -251,6 +254,7 @@ def sample_watermarked_token(
     top_p: float = 1.0,
     layers: int = TOURNAMENT_LAYERS,
     _warper: TopPLogitsWarper | None = None,
+    _generator: torch.Generator | None = None,
 ) -> int:
     """Sample one token using keyed tournament sampling.
 
@@ -282,22 +286,46 @@ def sample_watermarked_token(
 
     candidate_count = 1 << layers
 
-    sampled = torch.multinomial(probabilities, candidate_count, replacement=True)
+    if _generator is None:
+        sampled = torch.multinomial(probabilities, candidate_count, replacement=True)
+    else:
+        sampled = torch.multinomial(
+            probabilities,
+            candidate_count,
+            replacement=True,
+            generator=_generator,
+        )
 
     candidates = [int(token_id) for token_id in sampled.tolist()]
 
-    tie_breaks = torch.randint(
-        0,
-        2,
-        (candidate_count - 1,),
-        device=logits.device,
-    ).tolist()
+    if _generator is None:
+        tie_breaks = torch.randint(
+            0,
+            2,
+            (candidate_count - 1,),
+            device=logits.device,
+        ).tolist()
+    else:
+        tie_breaks = torch.randint(
+            0,
+            2,
+            (candidate_count - 1,),
+            device=logits.device,
+            generator=_generator,
+        ).tolist()
 
     tie_index = 0
 
     for layer in range(layers):
         if layer > 0:
-            permutation = torch.randperm(len(candidates), device=logits.device).tolist()
+            if _generator is None:
+                permutation = torch.randperm(len(candidates), device=logits.device).tolist()
+            else:
+                permutation = torch.randperm(
+                    len(candidates),
+                    device=logits.device,
+                    generator=_generator,
+                ).tolist()
 
             candidates = [candidates[int(index)] for index in permutation]
 

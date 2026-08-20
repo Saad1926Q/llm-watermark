@@ -9,7 +9,12 @@ from typing import Any
 
 from tqdm.auto import tqdm
 
-from src.generate import GenerationResult, generate_normal_batch, generate_watermarked_batch
+from src.generate import (
+    GenerationResult,
+    generate_normal_batch,
+    generate_watermarked_batch,
+    make_generators,
+)
 from src.watermark import DEFAULT_KEY_PATH, TOURNAMENT_LAYERS, load_key
 
 DEFAULT_SEED = 42
@@ -273,10 +278,11 @@ def main() -> None:
                     _render_prompt(selected[source_index]) for source_index in source_indices
                 ]
 
-                batch_seed = args.seed + split_start + batch_offset
-
-                torch.manual_seed(batch_seed)
-
+                prompt_seeds = [args.seed + source_index for source_index in source_indices]
+                normal_generators = make_generators(
+                    prompt_seeds,
+                    device=input_device,
+                )
                 normal_results = generate_normal_batch(
                     model,
                     tokenizer,
@@ -285,12 +291,16 @@ def main() -> None:
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_p=args.top_p,
+                    generators=normal_generators,
                 )
 
                 watermarked_results: list[GenerationResult] = []
 
                 if is_test:
-                    torch.manual_seed(batch_seed)
+                    watermarked_generators = make_generators(
+                        prompt_seeds,
+                        device=input_device,
+                    )
                     watermarked_results = generate_watermarked_batch(
                         model,
                         tokenizer,
@@ -301,6 +311,7 @@ def main() -> None:
                         temperature=args.temperature,
                         top_p=args.top_p,
                         layers=args.layers,
+                        generators=watermarked_generators,
                     )
 
                 for local_index, (source_index, normal_result) in enumerate(

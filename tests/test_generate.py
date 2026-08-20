@@ -66,54 +66,50 @@ class CacheModel:
         return SimpleNamespace(logits=logits, past_key_values=object())
 
 
-class NormalBatchModel:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-    def generate(
+class NormalCacheModel(CacheModel):
+    def __call__(
         self,
         *,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        **kwargs: object,
-    ) -> torch.Tensor:
-        self.calls.append(
-            {
-                "input_ids": input_ids.clone(),
-                "attention_mask": attention_mask.clone(),
-                "kwargs": kwargs,
-            }
+        use_cache: bool,
+        past_key_values: object | None = None,
+    ) -> SimpleNamespace:
+        output = super().__call__(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            past_key_values=past_key_values,
         )
-        generated = torch.tensor(
-            [[31, 32]] * input_ids.shape[0],
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-        return torch.cat((input_ids, generated), dim=1)
+        output.logits.fill_(-torch.inf)
+        output.logits[..., 31] = 0
+        return output
 
 
 def test_generate_normal_batch_preserves_order_and_batch_shape() -> None:
-    model = NormalBatchModel()
+    model = NormalCacheModel()
+    device = torch.device("cpu")
     results = generate.generate_normal_batch(
         model,
         FakeTokenizer(),
         ["short", "long"],
-        device=torch.device("cpu"),
+        generate.make_generators([101, 202], device=device),
+        device=device,
         max_new_tokens=2,
         temperature=0.7,
         top_p=0.8,
     )
 
-    assert [result.generated_token_ids for result in results] == [[31, 32], [31, 32]]
-    assert model.calls[0]["input_ids"].tolist() == [[0, 11, 12], [21, 22, 23]]
-    assert model.calls[0]["attention_mask"].tolist() == [[0, 1, 1], [1, 1, 1]]
-    assert model.calls[0]["kwargs"] == {
-        "max_new_tokens": 2,
-        "do_sample": True,
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "pad_token_id": 0,
-    }
+    assert [result.generated_token_ids for result in results] == [[31, 31], [31, 31]]
+    assert [call["input_ids"].tolist() for call in model.calls] == [
+        [[0, 11, 12], [21, 22, 23]],
+        [[31], [31]],
+    ]
+    assert [call["attention_mask"].tolist() for call in model.calls] == [
+        [[0, 1, 1], [1, 1, 1]],
+        [[0, 1, 1, 1], [1, 1, 1, 1]],
+    ]
+    assert all(call["use_cache"] is True for call in model.calls)
 
 
 @pytest.mark.parametrize("max_new_tokens", [0, -1])
@@ -123,6 +119,7 @@ def test_generate_normal_batch_requires_positive_max_tokens(max_new_tokens: int)
             object(),
             FakeTokenizer(),
             ["prompt"],
+            generate.make_generators([1], device=torch.device("cpu")),
             device=torch.device("cpu"),
             max_new_tokens=max_new_tokens,
         )
@@ -223,3 +220,57 @@ def test_generate_watermarked_batch_keeps_independent_row_state(
     ]
     assert [call["attention_mask"].shape[1] for call in model.calls] == [3, 4, 5]
     assert tokenizer.padding_side == "right"
+
+
+def test_per_prompt_generators_are_batch_size_independent() -> None:
+    prompts = ["short", "long"]
+    key = bytes(range(32))
+    device = torch.device("cpu")
+
+    batched_normal = generate.generate_normal_batch(
+        CacheModel(),
+        FakeTokenizer(),
+        prompts,
+        device=device,
+        max_new_tokens=5,
+        generators=generate.make_generators([101, 202], device=device),
+    )
+    separate_normal = [
+        generate.generate_normal_batch(
+            CacheModel(),
+            FakeTokenizer(),
+            [prompt],
+            device=device,
+            max_new_tokens=5,
+            generators=generate.make_generators([seed], device=device),
+        )[0]
+        for prompt, seed in zip(prompts, [101, 202], strict=True)
+    ]
+    assert [result.generated_token_ids for result in batched_normal] == [
+        result.generated_token_ids for result in separate_normal
+    ]
+
+    batched_watermarked = generate.generate_watermarked_batch(
+        CacheModel(),
+        FakeTokenizer(),
+        prompts,
+        key,
+        device=device,
+        max_new_tokens=5,
+        generators=generate.make_generators([101, 202], device=device),
+    )
+    separate_watermarked = [
+        generate.generate_watermarked_batch(
+            CacheModel(),
+            FakeTokenizer(),
+            [prompt],
+            key,
+            device=device,
+            max_new_tokens=5,
+            generators=generate.make_generators([seed], device=device),
+        )[0]
+        for prompt, seed in zip(prompts, [101, 202], strict=True)
+    ]
+    assert [result.generated_token_ids for result in batched_watermarked] == [
+        result.generated_token_ids for result in separate_watermarked
+    ]

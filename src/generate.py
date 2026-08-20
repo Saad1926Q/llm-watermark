@@ -30,6 +30,26 @@ class GenerationResult:
     text: str
 
 
+def make_generators(
+    seeds: Sequence[int],
+    *,
+    device: torch.device,
+) -> list[torch.Generator]:
+    """Create one deterministic sampling generator for each prompt seed."""
+    return [torch.Generator(device=device).manual_seed(seed) for seed in seeds]
+
+
+def _validate_generators(
+    generators: Sequence[torch.Generator] | None,
+    batch_size: int,
+) -> Sequence[torch.Generator] | None:
+    """Validate that per-prompt generators match the prompt batch."""
+    if generators is None:
+        return None
+    if len(generators) != batch_size:
+        raise ValueError("generators must contain one generator per prompt")
+    return generators
+
 def encode_prompt(tokenizer: Any, prompt: str) -> Any:
     """Tokenize a prompt, applying the tokenizer's chat template when available.
 
@@ -87,6 +107,7 @@ def generate_normal_batch(
     model: Any,
     tokenizer: Any,
     prompts: Sequence[str],
+    generators: Sequence[torch.Generator],
     *,
     device: torch.device,
     max_new_tokens: int = 1024,
@@ -100,53 +121,91 @@ def generate_normal_batch(
     prompt_list = list(prompts)
     if not prompt_list:
         return []
+    if len(generators) != len(prompt_list):
+        raise ValueError("generators must contain one generator per prompt")
 
     encoded = encode_prompts(tokenizer, prompt_list)
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded.get("attention_mask")
-
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
     else:
         attention_mask = attention_mask.to(device)
 
-    generation_kwargs: dict[str, Any] = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": True,
-        "temperature": temperature,
-        "top_p": top_p,
-    }
-
+    batch_size = len(prompt_list)
+    eos_token_id = tokenizer.eos_token_id
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
-
     if pad_token_id is None:
-        pad_token_id = tokenizer.eos_token_id
+        pad_token_id = eos_token_id
+    if pad_token_id is None:
+        raise ValueError("batch generation requires a pad token or eos token")
 
-    if pad_token_id is not None:
-        generation_kwargs["pad_token_id"] = pad_token_id
+    generated_token_ids: list[list[int]] = [[] for _ in prompt_list]
+    finished = [False] * batch_size
+    warper = TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=1)
 
     with torch.inference_mode():
-        output_ids = model.generate(
+        outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            **generation_kwargs,
+            use_cache=True,
         )
+        past_key_values = getattr(outputs, "past_key_values", None)
+        if past_key_values is None:
+            raise ValueError("model did not return past_key_values with use_cache=True")
 
-    prompt_width = input_ids.shape[1]
-
-    results: list[GenerationResult] = []
-
-    for row in range(len(prompt_list)):
-        generated_token_ids = [
-            int(token_id) for token_id in output_ids[row, prompt_width:].tolist()
-        ]
-        results.append(
-            GenerationResult(
-                generated_token_ids,
-                tokenizer.decode(generated_token_ids, skip_special_tokens=True),
+        for step in range(max_new_tokens):
+            next_token_ids = torch.full(
+                (batch_size, 1),
+                pad_token_id,
+                dtype=input_ids.dtype,
+                device=device,
             )
+
+            for row in range(batch_size):
+                if finished[row]:
+                    continue
+
+                next_token_id = sample_normally(
+                    outputs.logits[row, -1, :],
+                    temperature=temperature,
+                    top_p=top_p,
+                    _warper=warper,
+                    _generator=generators[row],
+                )
+                next_token_ids[row, 0] = next_token_id
+                generated_token_ids[row].append(next_token_id)
+
+                if eos_token_id is not None and next_token_id == eos_token_id:
+                    finished[row] = True
+
+            if all(finished) or step == max_new_tokens - 1:
+                break
+
+            attention_mask = torch.cat(
+                (
+                    attention_mask,
+                    attention_mask.new_ones((batch_size, 1)),
+                ),
+                dim=1,
+            )
+            outputs = model(
+                input_ids=next_token_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = getattr(outputs, "past_key_values", None)
+            if past_key_values is None:
+                raise ValueError("model did not return past_key_values with use_cache=True")
+
+    return [
+        GenerationResult(
+            token_ids,
+            tokenizer.decode(token_ids, skip_special_tokens=True),
         )
-    return results
+        for token_ids in generated_token_ids
+    ]
 
 
 def generate_normal(
@@ -158,6 +217,7 @@ def generate_normal(
     max_new_tokens: int = 1024,
     temperature: float = 1.0,
     top_p: float = 0.95,
+    generator: torch.Generator,
 ) -> GenerationResult:
     """Generate one ordinary continuation using the batch implementation."""
     return generate_normal_batch(
@@ -168,6 +228,7 @@ def generate_normal(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
+        generators=[generator],
     )[0]
 
 
@@ -181,6 +242,7 @@ def _select_next_token(
     top_p: float,
     layers: int,
     warper: TopPLogitsWarper,
+    _generator: torch.Generator | None = None,
 ) -> int:
     """Select one normal or watermarked token for a response row."""
     if len(generated_token_ids) < CONTEXT_WIDTH:
@@ -189,6 +251,7 @@ def _select_next_token(
             temperature=temperature,
             top_p=top_p,
             _warper=warper,
+            _generator=_generator,
         )
 
     context = generated_token_ids[-CONTEXT_WIDTH:]
@@ -202,6 +265,7 @@ def _select_next_token(
             temperature=temperature,
             top_p=top_p,
             _warper=warper,
+            _generator=_generator,
         )
 
     return sample_watermarked_token(
@@ -212,6 +276,7 @@ def _select_next_token(
         top_p=top_p,
         layers=layers,
         _warper=warper,
+        _generator=_generator,
     )
 
 
@@ -226,6 +291,7 @@ def generate_watermarked_batch(
     temperature: float = 1.0,
     top_p: float = 0.95,
     layers: int = TOURNAMENT_LAYERS,
+    generators: Sequence[torch.Generator] | None = None,
 ) -> list[GenerationResult]:
     """Generate independent watermarked continuations for a prompt batch."""
     if max_new_tokens <= 0:
@@ -234,6 +300,7 @@ def generate_watermarked_batch(
     prompt_list = list(prompts)
     if not prompt_list:
         return []
+    prompt_generators = _validate_generators(generators, len(prompt_list))
 
     encoded = encode_prompts(tokenizer, prompt_list)
     input_ids = encoded["input_ids"].to(device)
@@ -299,6 +366,9 @@ def generate_watermarked_batch(
                     top_p=top_p,
                     layers=layers,
                     warper=warper,
+                    _generator=(
+                        prompt_generators[row] if prompt_generators is not None else None
+                    ),
                 )
                 next_token_ids[row, 0] = next_token_id
                 generated_token_ids[row].append(next_token_id)
@@ -346,6 +416,7 @@ def generate_watermarked(
     temperature: float = 1.0,
     top_p: float = 0.95,
     layers: int = TOURNAMENT_LAYERS,
+    generator: torch.Generator | None = None,
 ) -> GenerationResult:
     """Generate one watermarked continuation using the batch implementation."""
     return generate_watermarked_batch(
@@ -358,4 +429,5 @@ def generate_watermarked(
         temperature=temperature,
         top_p=top_p,
         layers=layers,
+        generators=[generator] if generator is not None else None,
     )[0]
