@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from src.calibration import DEFAULT_TOKENIZATION_BATCH_SIZE
+
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser for frozen test-set evaluation.
@@ -36,6 +38,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--metrics-output",
         type=Path,
         help="Optional aggregate metrics JSON output",
+    )
+    parser.add_argument(
+        "--tokenization-batch-size",
+        type=int,
+        default=DEFAULT_TOKENIZATION_BATCH_SIZE,
+        help="Number of response texts encoded per tokenizer call",
     )
     return parser
 
@@ -87,7 +95,11 @@ def main(argv: list[str] | None = None) -> int:
     from transformers import AutoTokenizer
 
     from src.calibration import CalibrationError, read_jsonl
-    from src.detection import evaluate_row, load_calibration, summarize_predictions
+    from src.detection import (
+        evaluate_predictions,
+        load_calibration,
+        summarize_predictions,
+    )
     from src.watermark import load_key
 
     try:
@@ -102,19 +114,20 @@ def main(argv: list[str] | None = None) -> int:
         if not test_rows:
             raise CalibrationError("test JSONL is empty")
 
-        predictions = [
-            evaluate_row(
-                row,
-                calibration,
-                key,
-                tokenizer,
-                row_number=row_number,
+        predictions = list(
+            tqdm(
+                evaluate_predictions(
+                    test_rows,
+                    calibration,
+                    key,
+                    tokenizer,
+                    tokenization_batch_size=args.tokenization_batch_size,
+                ),
+                total=len(test_rows),
+                desc="Evaluating",
+                unit="row",
             )
-            for row_number, row in enumerate(
-                tqdm(test_rows, desc="Evaluating", unit="row"),
-                1,
-            )
-        ]
+        )
         metrics = summarize_predictions(predictions)
         _write_jsonl(args.predictions_output, predictions)
         if args.metrics_output is not None:

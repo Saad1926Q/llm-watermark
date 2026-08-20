@@ -9,6 +9,8 @@ from src.watermark import TOURNAMENT_LAYERS
 
 
 class FakeTokenizer:
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
     def __call__(
         self,
         text: str | list[str],
@@ -27,6 +29,7 @@ class FakeTokenizer:
 
         if isinstance(text, str):
             return {"input_ids": encode(text)}
+        self.batch_sizes.append(len(text))
         return {"input_ids": [encode(value) for value in text]}
 
 
@@ -97,17 +100,51 @@ def test_evaluate_rows_uses_separate_test_rows(monkeypatch) -> None:
 
     monkeypatch.setattr(detection, "_score_token_ids", fake_score_token_ids)
     metrics = evaluate_rows(
-        [_row("test-control", "unwatermarked"), _row("test-watermarked", "watermarked")],
+        [
+            _row("test-control-1", "unwatermarked"),
+            _row("test-watermarked", "watermarked"),
+            _row("test-control-2", "unwatermarked"),
+        ],
         calibration,
         key,
         tokenizer,
+        tokenization_batch_size=2,
     )
+    assert tokenizer.batch_sizes == [2, 1]
 
     assert metrics == {
-        "test_rows": 2,
+        "test_rows": 3,
         "test_insufficient_rows": 0,
-        "test_unwatermarked_rows": 1,
+        "test_unwatermarked_rows": 2,
         "test_watermarked_rows": 1,
         "test_fpr": 0.0,
         "test_tpr": 1.0,
     }
+
+
+def test_evaluate_predictions_preserves_batch_order() -> None:
+    key = bytes(range(32))
+    tokenizer = FakeTokenizer()
+    rows = [
+        _row("first", "unwatermarked"),
+        _row("second", "watermarked"),
+        _row("third", "unwatermarked"),
+    ]
+
+    predictions = list(
+        detection.evaluate_predictions(
+            rows,
+            _calibration(key),
+            key,
+            tokenizer,
+            tokenization_batch_size=2,
+        )
+    )
+
+    assert [prediction["prompt_id"] for prediction in predictions] == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert [prediction["row_number"] for prediction in predictions] == [1, 2, 3]
+    assert tokenizer.batch_sizes == [2, 1]

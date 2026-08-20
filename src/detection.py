@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from src.calibration import (
+    DEFAULT_TOKENIZATION_BATCH_SIZE,
     CalibrationError,
+    ScoreResult,
     _score_token_ids,
     _tokenize_texts,
     key_fingerprint,
@@ -41,6 +44,45 @@ def load_calibration(path: Path, key: bytes) -> dict[str, Any]:
     return artifact
 
 
+def _prediction_from_result(
+    row: Mapping[str, Any],
+    calibration: Mapping[str, Any],
+    result: ScoreResult,
+    *,
+    row_number: int,
+) -> dict[str, Any]:
+    """Build one prediction from a precomputed score."""
+    kind = row.get("kind")
+
+    threshold = float(calibration["threshold"])
+
+    score = result.score if result.sufficient else None
+
+    predicted_kind = (
+        None if score is None else "watermarked" if score >= threshold else "unwatermarked"
+    )
+
+    prediction = dict(row)
+
+    prediction.update(
+        {
+            "row_number": row_number,
+            "predicted_kind": predicted_kind,
+            "score": score,
+            "threshold": threshold,
+            "correct": None if predicted_kind is None else predicted_kind == kind,
+            "sufficient": result.sufficient,
+            "ones": result.ones,
+            "total_bits": result.total_bits,
+            "scored_contexts": result.scored_contexts,
+            "required_tokens": result.required_tokens,
+            "used_tokens": result.used_tokens,
+        }
+    )
+
+    return prediction
+
+
 def evaluate_row(
     row: Mapping[str, Any],
     calibration: Mapping[str, Any],
@@ -68,43 +110,84 @@ def evaluate_row(
     kind = row.get("kind")
     if kind not in {"unwatermarked", "watermarked"}:
         raise CalibrationError("row kind must be 'unwatermarked' or 'watermarked'")
+
     text = row.get("text")
+
     if not isinstance(text, str):
         raise CalibrationError("row text must be a string")
+
     token_ids = _tokenize_texts(
         [text],
         tokenizer,
         required_tokens=calibration["required_tokens"],
     )[0]
+
     result = _score_token_ids(
         token_ids,
         key,
         required_tokens=calibration["required_tokens"],
         layers=calibration["layers"],
     )
-    threshold = float(calibration["threshold"])
-    score = result.score if result.sufficient else None
-    predicted_kind = (
-        None if score is None else "watermarked" if score >= threshold else "unwatermarked"
+    return _prediction_from_result(
+        row,
+        calibration,
+        result,
+        row_number=row_number,
     )
 
-    prediction = dict(row)
-    prediction.update(
-        {
-            "row_number": row_number,
-            "predicted_kind": predicted_kind,
-            "score": score,
-            "threshold": threshold,
-            "correct": None if predicted_kind is None else predicted_kind == kind,
-            "sufficient": result.sufficient,
-            "ones": result.ones,
-            "total_bits": result.total_bits,
-            "scored_contexts": result.scored_contexts,
-            "required_tokens": result.required_tokens,
-            "used_tokens": result.used_tokens,
-        }
-    )
-    return prediction
+
+def evaluate_predictions(
+    test_rows: Iterable[Mapping[str, Any]],
+    calibration: Mapping[str, Any],
+    key: bytes,
+    tokenizer: Any,
+    *,
+    tokenization_batch_size: int = DEFAULT_TOKENIZATION_BATCH_SIZE,
+) -> Iterator[dict[str, Any]]:
+    """Batch-tokenize and score labeled test rows in input order."""
+    if type(tokenization_batch_size) is not int or tokenization_batch_size < 1:
+        raise CalibrationError("tokenization_batch_size must be a positive integer")
+
+    rows = iter(test_rows)
+    row_number = 0
+    while batch_rows := list(islice(rows, tokenization_batch_size)):
+        texts: list[str] = []
+
+        for row in batch_rows:
+            kind = row.get("kind")
+
+            if kind not in {"unwatermarked", "watermarked"}:
+                raise CalibrationError("row kind must be 'unwatermarked' or 'watermarked'")
+
+            text = row.get("text")
+
+            if not isinstance(text, str):
+                raise CalibrationError("row text must be a string")
+
+            texts.append(text)
+
+        token_batches = _tokenize_texts(
+            texts,
+            tokenizer,
+            required_tokens=calibration["required_tokens"],
+        )
+
+        for row, token_ids in zip(batch_rows, token_batches, strict=True):
+            row_number += 1
+
+            result = _score_token_ids(
+                token_ids,
+                key,
+                required_tokens=calibration["required_tokens"],
+                layers=calibration["layers"],
+            )
+
+            yield _prediction_from_result(
+                row,
+                calibration,
+                result,
+                row_number=row_number,
+            )
 
 
 def summarize_predictions(
@@ -118,10 +201,15 @@ def summarize_predictions(
     Returns:
         Counts of test rows and sufficient classes, plus FPR and TPR values.
     """
+    # Unwatermarked responses are the negative controls.
     controls = 0
+    # Watermarked responses are the positive examples.
     watermarked = 0
+    # Controls incorrectly classified as watermarked.
     false_positives = 0
+    # Watermarked responses correctly classified as watermarked.
     true_positives = 0
+    # Too-short responses are excluded from FPR and TPR.
     insufficient = 0
     total = 0
 
@@ -131,6 +219,7 @@ def summarize_predictions(
             insufficient += 1
             continue
 
+        # Whether this response was classified as watermarked.
         positive = prediction["predicted_kind"] == "watermarked"
         if prediction["kind"] == "unwatermarked":
             controls += 1
@@ -154,6 +243,8 @@ def evaluate_rows(
     calibration: Mapping[str, Any],
     key: bytes,
     tokenizer: Any,
+    *,
+    tokenization_batch_size: int = DEFAULT_TOKENIZATION_BATCH_SIZE,
 ) -> dict[str, Any]:
     """Evaluate a frozen calibration artifact on labeled test rows.
 
@@ -162,18 +253,16 @@ def evaluate_rows(
         calibration: Frozen threshold and scoring configuration.
         key: Secret watermark key used to score responses.
         tokenizer: Tokenizer used to encode response text.
+        tokenization_batch_size: Number of response texts encoded per call.
 
     Returns:
         Aggregate test-set counts, false-positive rate, and true-positive rate.
     """
-    predictions = (
-        evaluate_row(
-            row,
-            calibration,
-            key,
-            tokenizer,
-            row_number=row_number,
-        )
-        for row_number, row in enumerate(test_rows, 1)
+    predictions = evaluate_predictions(
+        test_rows,
+        calibration,
+        key,
+        tokenizer,
+        tokenization_batch_size=tokenization_batch_size,
     )
     return summarize_predictions(predictions)
