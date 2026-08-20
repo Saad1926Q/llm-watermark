@@ -7,7 +7,12 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from src.calibration import CalibrationError, key_fingerprint, score_row
+from src.calibration import (
+    CalibrationError,
+    _score_token_ids,
+    _tokenize_texts,
+    key_fingerprint,
+)
 
 
 def load_calibration(path: Path, key: bytes) -> dict[str, Any]:
@@ -63,11 +68,17 @@ def evaluate_row(
     kind = row.get("kind")
     if kind not in {"unwatermarked", "watermarked"}:
         raise CalibrationError("row kind must be 'unwatermarked' or 'watermarked'")
-
-    result = score_row(
-        row,
-        key,
+    text = row.get("text")
+    if not isinstance(text, str):
+        raise CalibrationError("row text must be a string")
+    token_ids = _tokenize_texts(
+        [text],
         tokenizer,
+        required_tokens=calibration["required_tokens"],
+    )[0]
+    result = _score_token_ids(
+        token_ids,
+        key,
         required_tokens=calibration["required_tokens"],
         layers=calibration["layers"],
     )

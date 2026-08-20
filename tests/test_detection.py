@@ -11,12 +11,23 @@ from src.watermark import TOURNAMENT_LAYERS
 class FakeTokenizer:
     def __call__(
         self,
-        text: str,
+        text: str | list[str],
         *,
         add_special_tokens: bool = False,
-    ) -> dict[str, list[int]]:
+        padding: bool = False,
+        truncation: bool = False,
+        max_length: int | None = None,
+    ) -> dict[str, list[int] | list[list[int]]]:
         assert add_special_tokens is False
-        return {"input_ids": list(range(100, 100 + len(text)))}
+        assert padding is False
+
+        def encode(value: str) -> list[int]:
+            token_ids = [ord(value[0]), *range(100, 100 + len(value) - 1)]
+            return token_ids[:max_length] if truncation and max_length is not None else token_ids
+
+        if isinstance(text, str):
+            return {"input_ids": encode(text)}
+        return {"input_ids": [encode(value) for value in text]}
 
 
 def _calibration(key: bytes, *, threshold: float = 0.5) -> dict[str, Any]:
@@ -34,7 +45,7 @@ def _row(prompt_id: str, kind: str) -> dict[str, Any]:
     return {
         "prompt_id": prompt_id,
         "kind": kind,
-        "text": "x" * 10,
+        "text": ("w" if kind == "watermarked" else "u") * 10,
     }
 
 
@@ -66,10 +77,16 @@ def test_evaluate_rows_uses_separate_test_rows(monkeypatch) -> None:
     calibration = _calibration(key)
     tokenizer = FakeTokenizer()
 
-    def fake_score_row(row, _key, _tokenizer, *, required_tokens, layers):
-        assert _tokenizer is tokenizer
+    def fake_score_token_ids(
+        token_ids,
+        _key,
+        *,
+        required_tokens,
+        layers,
+    ):
+        assert _key is key
         assert layers == TOURNAMENT_LAYERS
-        score = 0.9 if row["kind"] == "watermarked" else 0.1
+        score = 0.9 if token_ids[0] == ord("w") else 0.1
         return ScoreResult(
             ones=round(score * 10),
             total_bits=10,
@@ -78,7 +95,7 @@ def test_evaluate_rows_uses_separate_test_rows(monkeypatch) -> None:
             used_tokens=required_tokens,
         )
 
-    monkeypatch.setattr(detection, "score_row", fake_score_row)
+    monkeypatch.setattr(detection, "_score_token_ids", fake_score_token_ids)
     metrics = evaluate_rows(
         [_row("test-control", "unwatermarked"), _row("test-watermarked", "watermarked")],
         calibration,

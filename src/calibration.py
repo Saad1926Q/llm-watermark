@@ -13,6 +13,7 @@ from typing import Any
 from src.watermark import TOURNAMENT_LAYERS, score_tokens
 
 DEFAULT_REQUIRED_TOKENS = 200
+DEFAULT_TOKENIZATION_BATCH_SIZE = 64
 
 
 class CalibrationError(ValueError):
@@ -31,33 +32,37 @@ def key_fingerprint(key: bytes) -> str:
     return hashlib.blake2b(key, digest_size=16).hexdigest()
 
 
-def _text_token_ids(row: Mapping[str, object], tokenizer: Any) -> list[int]:
-    """Tokenize one response row without adding special tokens.
-
-    Args:
-        row: Mapping containing the response text under ``text``.
-        tokenizer: Tokenizer used to encode the response text.
-
-    Returns:
-        A list of non-negative token IDs.
-
-    Raises:
-        CalibrationError: If the row text or tokenizer output is invalid.
-    """
-    text = row.get("text")
-    if not isinstance(text, str):
-        raise CalibrationError("row text must be a string")
-
+def _tokenize_texts(
+    texts: list[str],
+    tokenizer: Any,
+    *,
+    required_tokens: int,
+) -> list[list[int]]:
+    """Tokenize response texts together and validate every token-ID sequence."""
     try:
-        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        token_batches = tokenizer(
+            texts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=True,
+            max_length=required_tokens,
+        )["input_ids"]
     except (KeyError, TypeError, ValueError) as exc:
         raise CalibrationError("tokenizer did not return input_ids") from exc
 
-    if not isinstance(token_ids, list) or any(
-        type(token_id) is not int or token_id < 0 for token_id in token_ids
+    if (
+        not isinstance(token_batches, list)
+        or len(token_batches) != len(texts)
+        or any(
+            not isinstance(token_ids, list)
+            or any(type(token_id) is not int or token_id < 0 for token_id in token_ids)
+            for token_ids in token_batches
+        )
     ):
-        raise CalibrationError("tokenizer input_ids must be a list of non-negative integers")
-    return token_ids
+        raise CalibrationError(
+            "tokenizer input_ids must contain one list of non-negative integers per text"
+        )
+    return token_batches
 
 
 @dataclass(frozen=True)
@@ -94,35 +99,14 @@ class ScoreResult:
         return self.ones / self.total_bits
 
 
-def score_row(
-    row: Mapping[str, object],
+def _score_token_ids(
+    token_ids: list[int],
     key: bytes,
-    tokenizer: Any,
     *,
-    required_tokens: int = DEFAULT_REQUIRED_TOKENS,
-    layers: int = TOURNAMENT_LAYERS,
+    required_tokens: int,
+    layers: int,
 ) -> ScoreResult:
-    """Tokenize and score the first fixed-length response prefix.
-
-    Args:
-        row: Mapping containing the response text under ``text``.
-        key: Secret watermark key used to score token choices.
-        tokenizer: Tokenizer used to encode the response text.
-        required_tokens: Number of response tokens to score.
-        layers: Number of watermark layers to score per context.
-
-    Returns:
-        A ``ScoreResult`` containing keyed one-bit counts and token usage.
-
-    Raises:
-        CalibrationError: If the configuration or tokenizer output is invalid.
-    """
-    if type(required_tokens) is not int or required_tokens < 1:
-        raise CalibrationError("required_tokens must be a positive integer")
-    if type(layers) is not int or layers < 1:
-        raise CalibrationError("layers must be a positive integer")
-
-    token_ids = _text_token_ids(row, tokenizer)
+    """Score one already-tokenized fixed-length response prefix."""
     if len(token_ids) < required_tokens:
         return ScoreResult(
             ones=0,
@@ -217,31 +201,17 @@ def fit_calibration(
     target_fpr: float,
     required_tokens: int = DEFAULT_REQUIRED_TOKENS,
     layers: int = TOURNAMENT_LAYERS,
+    tokenization_batch_size: int = DEFAULT_TOKENIZATION_BATCH_SIZE,
 ) -> dict[str, Any]:
-    """Fit a threshold using unwatermarked development response text only.
-
-    Args:
-        development_rows: Labeled development rows containing response text.
-        key: Secret watermark key used to score responses.
-        tokenizer: Tokenizer used to encode response text.
-        target_fpr: Maximum allowed development false-positive rate.
-        required_tokens: Number of response tokens to score per row.
-        layers: Number of watermark layers to score per context.
-
-    Returns:
-        A JSON-serializable calibration artifact containing the fitted threshold
-        and the scoring metadata required for evaluation.
-
-    Raises:
-        CalibrationError: If row metadata, configuration, or scores are invalid.
-    """
+    """Fit a threshold using unwatermarked development response text only."""
     if type(required_tokens) is not int or required_tokens < 1:
         raise CalibrationError("required_tokens must be a positive integer")
     if type(layers) is not int or layers < 1:
         raise CalibrationError("layers must be a positive integer")
+    if type(tokenization_batch_size) is not int or tokenization_batch_size < 1:
+        raise CalibrationError("tokenization_batch_size must be a positive integer")
 
-    scores: list[float] = []
-    insufficient = 0
+    unwatermarked_texts: list[str] = []
     metadata: tuple[str, str] | None = None
     total = 0
 
@@ -259,26 +229,36 @@ def fit_calibration(
             raise CalibrationError("row tokenizer must be a non-empty string")
 
         pair = (model_name, tokenizer_name)
-
         if metadata is None:
             metadata = pair
         elif pair != metadata:
             raise CalibrationError("development rows use inconsistent model/tokenizer metadata")
+        if kind == "unwatermarked":
+            text = row.get("text")
+            if not isinstance(text, str):
+                raise CalibrationError("row text must be a string")
+            unwatermarked_texts.append(text)
 
-        if kind == "watermarked":
-            continue
-
-        result = score_row(
-            row,
-            key,
+    scores: list[float] = []
+    insufficient = 0
+    for batch_start in range(0, len(unwatermarked_texts), tokenization_batch_size):
+        texts = unwatermarked_texts[batch_start : batch_start + tokenization_batch_size]
+        token_batches = _tokenize_texts(
+            texts,
             tokenizer,
             required_tokens=required_tokens,
-            layers=layers,
         )
-        if result.sufficient:
-            scores.append(result.score)
-        else:
-            insufficient += 1
+        for token_ids in token_batches:
+            result = _score_token_ids(
+                token_ids,
+                key,
+                required_tokens=required_tokens,
+                layers=layers,
+            )
+            if result.sufficient:
+                scores.append(result.score)
+            else:
+                insufficient += 1
 
     threshold, observed = _fit(scores, target_fpr)
     return {

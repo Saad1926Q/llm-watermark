@@ -4,19 +4,41 @@ from typing import Any
 
 import pytest
 
-from src.calibration import CalibrationError, ScoreResult, fit_calibration, score_row
+from src.calibration import (
+    CalibrationError,
+    ScoreResult,
+    _score_token_ids,
+    _tokenize_texts,
+    fit_calibration,
+)
 from src.watermark import CONTEXT_WIDTH, TOURNAMENT_LAYERS
 
 
 class FakeTokenizer:
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
     def __call__(
         self,
-        text: str,
+        text: str | list[str],
         *,
         add_special_tokens: bool = False,
-    ) -> dict[str, list[int]]:
+        padding: bool = False,
+        truncation: bool = False,
+        max_length: int | None = None,
+    ) -> dict[str, list[int] | list[list[int]]]:
         assert add_special_tokens is False
-        return {"input_ids": list(range(100, 100 + len(text)))}
+        assert padding is False
+
+        def encode(value: str) -> list[int]:
+            token_ids = [ord(character) * 1000 + index for index, character in enumerate(value)]
+            return token_ids[:max_length] if truncation and max_length is not None else token_ids
+
+        if isinstance(text, str):
+            return {"input_ids": encode(text)}
+
+        self.batch_sizes.append(len(text))
+        return {"input_ids": [encode(value) for value in text]}
 
 
 def _row(
@@ -34,46 +56,50 @@ def _row(
     }
 
 
-def test_score_row_tokenizes_text_and_uses_exact_required_prefix() -> None:
+def test_batched_tokenization_and_scoring_use_exact_required_prefix() -> None:
     key = bytes(range(32))
     tokenizer = FakeTokenizer()
     required_tokens = 10
     prefix_text = "x" * required_tokens
+    token_batches = _tokenize_texts(
+        [prefix_text, prefix_text + "y" * 100],
+        tokenizer,
+        required_tokens=required_tokens,
+    )
 
-    prefix_result = score_row(
-        {"text": prefix_text},
-        key,
-        tokenizer,
-        required_tokens=required_tokens,
-        layers=TOURNAMENT_LAYERS,
-    )
-    longer_result = score_row(
-        {"text": prefix_text + "y" * 100},
-        key,
-        tokenizer,
-        required_tokens=required_tokens,
-        layers=TOURNAMENT_LAYERS,
-    )
+    prefix_result, longer_result = [
+        _score_token_ids(
+            token_ids,
+            key,
+            required_tokens=required_tokens,
+            layers=TOURNAMENT_LAYERS,
+        )
+        for token_ids in token_batches
+    ]
 
     assert prefix_result == longer_result
     assert prefix_result.sufficient is True
     assert prefix_result.used_tokens == required_tokens
     assert prefix_result.scored_contexts == required_tokens - CONTEXT_WIDTH
     assert prefix_result.total_bits == prefix_result.scored_contexts * TOURNAMENT_LAYERS
+    assert tokenizer.batch_sizes == [2]
 
 
 def test_short_response_is_insufficient() -> None:
     key = bytes(range(32))
     tokenizer = FakeTokenizer()
-
-    result = score_row(
-        {"text": "x" * 9},
-        key,
+    token_ids = _tokenize_texts(
+        ["x" * 9],
         tokenizer,
+        required_tokens=10,
+    )[0]
+
+    result = _score_token_ids(
+        token_ids,
+        key,
         required_tokens=10,
         layers=TOURNAMENT_LAYERS,
     )
-
     assert result.sufficient is False
     assert result.used_tokens == 9
     assert result.scored_contexts == 0
@@ -82,20 +108,26 @@ def test_short_response_is_insufficient() -> None:
         _ = result.score
 
 
-def test_threshold_uses_only_development_unwatermarked_scores(monkeypatch) -> None:
+def test_threshold_batches_only_development_unwatermarked_scores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     key = bytes(range(32))
     tokenizer = FakeTokenizer()
-    score_values = {
-        "dev-negative-low": 0.2,
-        "dev-negative-high": 0.8,
-        "dev-watermarked": 1.0,
+    development_rows = [
+        _row("dev-negative-low", text="a" * 10),
+        _row("dev-negative-high", text="b" * 10),
+        _row("dev-watermarked", kind="watermarked", text="c" * 10),
+    ]
+    score_by_first_token = {
+        ord("a") * 1000: 0.2,
+        ord("b") * 1000: 0.8,
     }
 
-    def fake_score_row(row, _key, _tokenizer, *, required_tokens, layers):
-        assert _tokenizer is tokenizer
+    def fake_score_token_ids(token_ids, _key, *, required_tokens, layers):
+        assert _key is key
         assert required_tokens == 10
         assert layers == TOURNAMENT_LAYERS
-        score = score_values[row["prompt_id"]]
+        score = score_by_first_token[token_ids[0]]
         return ScoreResult(
             ones=round(score * 10),
             total_bits=10,
@@ -104,34 +136,19 @@ def test_threshold_uses_only_development_unwatermarked_scores(monkeypatch) -> No
             used_tokens=required_tokens,
         )
 
-    monkeypatch.setattr("src.calibration.score_row", fake_score_row)
-    development_rows = [
-        _row("dev-negative-low"),
-        _row("dev-negative-high"),
-        _row("dev-watermarked", kind="watermarked"),
-    ]
-
-    first = fit_calibration(
+    monkeypatch.setattr("src.calibration._score_token_ids", fake_score_token_ids)
+    artifact = fit_calibration(
         development_rows,
         key,
         tokenizer,
         target_fpr=0.5,
         required_tokens=10,
         layers=TOURNAMENT_LAYERS,
+        tokenization_batch_size=1,
     )
 
-    score_values["dev-watermarked"] = 0.0
-    second = fit_calibration(
-        development_rows,
-        key,
-        tokenizer,
-        target_fpr=0.5,
-        required_tokens=10,
-        layers=TOURNAMENT_LAYERS,
-    )
-
-    assert first["threshold"] == pytest.approx(0.8)
-    assert second["threshold"] == first["threshold"]
-    assert second["development_rows"] == 3
-    assert second["development_sufficient_rows"] == 2
-    assert second["development_insufficient_rows"] == 0
+    assert artifact["threshold"] == pytest.approx(0.8)
+    assert artifact["development_rows"] == 3
+    assert artifact["development_sufficient_rows"] == 2
+    assert artifact["development_insufficient_rows"] == 0
+    assert tokenizer.batch_sizes == [1, 1]

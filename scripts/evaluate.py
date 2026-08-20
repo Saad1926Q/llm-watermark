@@ -83,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    from tqdm.auto import tqdm
     from transformers import AutoTokenizer
 
     from src.calibration import CalibrationError, read_jsonl
@@ -109,7 +110,10 @@ def main(argv: list[str] | None = None) -> int:
                 tokenizer,
                 row_number=row_number,
             )
-            for row_number, row in enumerate(test_rows, 1)
+            for row_number, row in enumerate(
+                tqdm(test_rows, desc="Evaluating", unit="row"),
+                1,
+            )
         ]
         metrics = summarize_predictions(predictions)
         _write_jsonl(args.predictions_output, predictions)

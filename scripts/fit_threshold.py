@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from src.calibration import DEFAULT_REQUIRED_TOKENS
+from src.calibration import DEFAULT_REQUIRED_TOKENS, DEFAULT_TOKENIZATION_BATCH_SIZE
 from src.watermark import TOURNAMENT_LAYERS
 
 
@@ -25,6 +25,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--key", type=Path)
     parser.add_argument("--target-fpr", type=float, default=0.01)
     parser.add_argument("--required-tokens", type=int, default=DEFAULT_REQUIRED_TOKENS)
+    parser.add_argument(
+        "--tokenization-batch-size",
+        type=int,
+        default=DEFAULT_TOKENIZATION_BATCH_SIZE,
+    )
     parser.add_argument("--layers", type=int, default=TOURNAMENT_LAYERS)
     return parser
 
@@ -41,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    from tqdm.auto import tqdm
     from transformers import AutoTokenizer
 
     from src.calibration import CalibrationError, fit_calibration, read_jsonl
@@ -58,11 +64,12 @@ def main(argv: list[str] | None = None) -> int:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
         artifact = fit_calibration(
-            development_rows,
+            tqdm(development_rows, desc="Fitting threshold", unit="row"),
             key,
             tokenizer,
             target_fpr=args.target_fpr,
             required_tokens=args.required_tokens,
+            tokenization_batch_size=args.tokenization_batch_size,
             layers=args.layers,
         )
 

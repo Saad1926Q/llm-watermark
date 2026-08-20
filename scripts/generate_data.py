@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from tqdm.auto import tqdm
+
 from src.generate import GenerationResult, generate_normal_batch, generate_watermarked_batch
 from src.watermark import DEFAULT_KEY_PATH, TOURNAMENT_LAYERS, load_key
 
@@ -131,6 +133,7 @@ def _generation_rows(
             tokenizer_name=tokenizer_name,
         )
     ]
+
     if watermarked_result is not None:
         rows.append(
             _generation_row(
@@ -141,6 +144,7 @@ def _generation_rows(
                 tokenizer_name=tokenizer_name,
             )
         )
+
     return tuple(rows)
 
 
@@ -231,38 +235,48 @@ def main() -> None:
         raise ValueError(f"requested {total_count} rows but dataset has only {len(dataset)}")
 
     selected = dataset.shuffle(seed=args.seed).select(range(total_count))
+
     tokenizer_name = str(getattr(tokenizer, "name_or_path", args.model))
+
     development_path = args.output_dir / "development.jsonl"
+
     test_path = args.output_dir / "test.jsonl"
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     with (
         development_path.open("w", encoding="utf-8") as development_file,
         test_path.open("w", encoding="utf-8") as test_file,
+        tqdm(total=total_count, desc="Generating", unit="prompt") as progress,
     ):
-        development_records: list[tuple[str, str, int]] = []
-        test_records: list[tuple[str, str, int]] = []
-        for index, row in enumerate(selected):
-            is_development = index < args.development_count
-            dataset_name = "development" if is_development else "test"
-            split_index = index if is_development else index - args.development_count
-            record = (
-                f"{dataset_name}-{split_index:04d}",
-                _render_prompt(row),
-                index,
-            )
-            (development_records if is_development else test_records).append(record)
+        splits = (
+            ("development", 0, args.development_count, development_file, False),
+            (
+                "test",
+                args.development_count,
+                args.test_count,
+                test_file,
+                True,
+            ),
+        )
 
-        for records, output_file, is_test in (
-            (development_records, development_file, False),
-            (test_records, test_file, True),
-        ):
-            for batch_start in range(0, len(records), args.batch_size):
-                batch_records = records[batch_start : batch_start + args.batch_size]
-                prompts = [record[1] for record in batch_records]
-                batch_seed = args.seed + batch_records[0][2]
+        for split_name, split_start, split_count, output_file, is_test in splits:
+            for batch_offset in range(0, split_count, args.batch_size):
+                batch_end = min(batch_offset + args.batch_size, split_count)
+
+                source_indices = range(
+                    split_start + batch_offset,
+                    split_start + batch_end,
+                )
+
+                prompts = [
+                    _render_prompt(selected[source_index]) for source_index in source_indices
+                ]
+
+                batch_seed = args.seed + split_start + batch_offset
 
                 torch.manual_seed(batch_seed)
+
                 normal_results = generate_normal_batch(
                     model,
                     tokenizer,
@@ -274,6 +288,7 @@ def main() -> None:
                 )
 
                 watermarked_results: list[GenerationResult] = []
+
                 if is_test:
                     torch.manual_seed(batch_seed)
                     watermarked_results = generate_watermarked_batch(
@@ -288,13 +303,14 @@ def main() -> None:
                         layers=args.layers,
                     )
 
-                for local_index, (record, normal_result) in enumerate(
-                    zip(batch_records, normal_results, strict=True)
+                for local_index, (source_index, normal_result) in enumerate(
+                    zip(source_indices, normal_results, strict=True)
                 ):
-                    prompt_id, _, source_index = record
-                    watermarked_result = (
-                        watermarked_results[local_index] if is_test else None
-                    )
+                    split_index = source_index - split_start
+                    prompt_id = f"{split_name}-{split_index:04d}"
+
+                    watermarked_result = watermarked_results[local_index] if is_test else None
+
                     rows = _generation_rows(
                         prompt_id=prompt_id,
                         normal_result=normal_result,
@@ -302,9 +318,11 @@ def main() -> None:
                         model_name=args.model,
                         tokenizer_name=tokenizer_name,
                     )
+
                     for generated_row in rows:
                         output_file.write(json.dumps(generated_row, ensure_ascii=False) + "\n")
-                    print(f"[{source_index + 1}/{total_count}] generated {prompt_id}")
+
+                progress.update(len(prompts))
 
     print(f"Saved development data to {development_path}")
     print(f"Saved test data to {test_path}")
