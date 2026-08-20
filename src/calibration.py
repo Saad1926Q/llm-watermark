@@ -184,13 +184,28 @@ def _fit(scores: list[float], target_fpr: float) -> tuple[float, float]:
     ):
         raise CalibrationError("target_fpr must be a finite number in [0, 1]")
 
-    ordered = sorted(scores)
+    # Scan high-to-low so the number of scores above each threshold grows.
+    ordered = sorted(scores, reverse=True)
     allowed = math.floor(float(target_fpr) * len(ordered) + 1e-12)
-    for threshold in sorted(set(ordered)):
-        count = sum(score >= threshold for score in ordered)
-        if count <= allowed:
-            return threshold, count / len(ordered)
-    return math.nextafter(ordered[-1], math.inf), 0.0
+    selected_threshold: float | None = None
+    selected_count = 0
+    count = 0
+
+    for index, threshold in enumerate(ordered):
+        # Every score seen so far is >= the current threshold.
+        count += 1
+        # Wait until all duplicate scores are counted together.
+        if index + 1 < len(ordered) and ordered[index + 1] == threshold:
+            continue
+        if count > allowed:
+            break
+        selected_threshold = threshold
+        selected_count = count
+
+    if selected_threshold is not None:
+        return selected_threshold, selected_count / len(ordered)
+    # No observed threshold meets the budget; use a value above the maximum score.
+    return math.nextafter(ordered[0], math.inf), 0.0
 
 
 def fit_calibration(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from src.calibration import (
     CalibrationError,
     ScoreResult,
+    _fit,
     _score_token_ids,
     _tokenize_texts,
     fit_calibration,
@@ -106,6 +108,19 @@ def test_short_response_is_insufficient() -> None:
     assert result.total_bits == 0
     with pytest.raises(CalibrationError, match="no watermark bits"):
         _ = result.score
+
+
+def test_fit_threshold_keeps_ties_and_selects_smallest_valid_threshold() -> None:
+    assert _fit([0.1, 0.2, 0.4, 0.8], 0.5) == pytest.approx((0.4, 0.5))
+    assert _fit([0.1, 0.2, 0.2, 0.8], 0.5) == pytest.approx((0.8, 0.25))
+
+
+def test_fit_threshold_handles_zero_and_full_false_positive_budgets() -> None:
+    scores = [0.2, 0.4, 0.8]
+    threshold, observed = _fit(scores, 0.0)
+    assert threshold == math.nextafter(max(scores), math.inf)
+    assert observed == 0.0
+    assert _fit(scores, 1.0) == pytest.approx((0.2, 1.0))
 
 
 def test_threshold_batches_only_development_unwatermarked_scores(
