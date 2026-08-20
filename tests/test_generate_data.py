@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.generate_data import _generation_row, _generation_rows
+from scripts.generate_data import _build_parser, _generation_row, _generation_rows
 from src.generate import GenerationResult
 
 
@@ -45,3 +45,11 @@ def test_generation_rows_only_pair_test_prompts() -> None:
 
     assert [row["kind"] for row in development_rows] == ["unwatermarked"]
     assert [row["kind"] for row in test_rows] == ["unwatermarked", "watermarked"]
+
+
+
+def test_generation_parser_exposes_batch_size() -> None:
+    parser = _build_parser()
+
+    assert parser.parse_args(["--model", "test-model"]).batch_size == 1
+    assert parser.parse_args(["--model", "test-model", "--batch-size", "4"]).batch_size == 4

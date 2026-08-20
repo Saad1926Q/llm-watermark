@@ -83,6 +83,72 @@ def encode_prompts(tokenizer: Any, prompts: Sequence[str]) -> Any:
             tokenizer.padding_side = original_padding_side
 
 
+def generate_normal_batch(
+    model: Any,
+    tokenizer: Any,
+    prompts: Sequence[str],
+    *,
+    device: torch.device,
+    max_new_tokens: int = 1024,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+) -> list[GenerationResult]:
+    """Generate ordinary stochastic continuations for a prompt batch."""
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+
+    prompt_list = list(prompts)
+    if not prompt_list:
+        return []
+
+    encoded = encode_prompts(tokenizer, prompt_list)
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded.get("attention_mask")
+
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        attention_mask = attention_mask.to(device)
+
+    generation_kwargs: dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": True,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
+
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+
+    if pad_token_id is not None:
+        generation_kwargs["pad_token_id"] = pad_token_id
+
+    with torch.inference_mode():
+        output_ids = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **generation_kwargs,
+        )
+
+    prompt_width = input_ids.shape[1]
+
+    results: list[GenerationResult] = []
+
+    for row in range(len(prompt_list)):
+        generated_token_ids = [
+            int(token_id) for token_id in output_ids[row, prompt_width:].tolist()
+        ]
+        results.append(
+            GenerationResult(
+                generated_token_ids,
+                tokenizer.decode(generated_token_ids, skip_special_tokens=True),
+            )
+        )
+    return results
+
+
 def generate_normal(
     model: Any,
     tokenizer: Any,
@@ -93,46 +159,16 @@ def generate_normal(
     temperature: float = 1.0,
     top_p: float = 0.95,
 ) -> GenerationResult:
-    """Generate an ordinary stochastic continuation and preserve exact IDs.
-
-    Args:
-        model: Evaluation-mode causal language model.
-        tokenizer: Tokenizer corresponding to ``model``.
-        prompt: Text to use as the generation prefix.
-        device: Device on which model inputs are stored.
-        max_new_tokens: Maximum number of tokens to append to ``prompt``.
-        temperature: Sampling temperature passed to Transformers.
-        top_p: Nucleus sampling threshold passed to Transformers.
-
-    Returns:
-        Generated IDs and decoded generated continuation.
-
-    Raises:
-        ValueError: If ``max_new_tokens`` is negative.
-    """
-    if max_new_tokens < 0:
-        raise ValueError("max_new_tokens must be non-negative")
-
-    encoded = encode_prompt(tokenizer, prompt)
-    input_ids = encoded["input_ids"].to(device)
-
-    generation_kwargs: dict[str, Any] = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": True,
-        "temperature": temperature,
-        "top_p": top_p,
-    }
-    if tokenizer.eos_token_id is not None:
-        generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
-
-    with torch.inference_mode():
-        output_ids = model.generate(input_ids=input_ids, **generation_kwargs)
-
-    generated_token_ids = [
-        int(token_id) for token_id in output_ids[0, input_ids.shape[1] :].tolist()
-    ]
-    text = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-    return GenerationResult(generated_token_ids, text)
+    """Generate one ordinary continuation using the batch implementation."""
+    return generate_normal_batch(
+        model,
+        tokenizer,
+        [prompt],
+        device=device,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )[0]
 
 
 def _select_next_token(
@@ -192,18 +228,12 @@ def generate_watermarked_batch(
     layers: int = TOURNAMENT_LAYERS,
 ) -> list[GenerationResult]:
     """Generate independent watermarked continuations for a prompt batch."""
-    if max_new_tokens < 0:
-        raise ValueError("max_new_tokens must be non-negative")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
 
     prompt_list = list(prompts)
     if not prompt_list:
         return []
-
-    if max_new_tokens == 0:
-        return [
-            GenerationResult([], tokenizer.decode([], skip_special_tokens=True))
-            for _ in prompt_list
-        ]
 
     encoded = encode_prompts(tokenizer, prompt_list)
     input_ids = encoded["input_ids"].to(device)

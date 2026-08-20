@@ -119,6 +119,7 @@ uv run python -m scripts.generate_data \
     --temperature 0.7 \
     --top-p 0.8 \
     --device-map auto \
+    --batch-size 4 \
     --output-dir outputs/calibration
 
 uv run python -m scripts.fit_threshold \
@@ -136,6 +137,9 @@ uv run python -m scripts.evaluate \
 
 `generate_data` writes two files. Development prompts produce one ordinary
 row each. Test prompts produce one ordinary and one watermarked row each:
+
+`--batch-size` controls how many prompts are generated in one model batch;
+use `1` to disable batching when memory is limited.
 
 ```text
 outputs/calibration/development.jsonl  # development-count rows

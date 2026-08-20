@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from src.generate import GenerationResult, generate_normal, generate_watermarked
+from src.generate import GenerationResult, generate_normal_batch, generate_watermarked_batch
 from src.watermark import DEFAULT_KEY_PATH, TOURNAMENT_LAYERS, load_key
 
 DEFAULT_SEED = 42
@@ -173,6 +173,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of prompts processed per generation batch",
+    )
     parser.add_argument("--layers", type=int, default=TOURNAMENT_LAYERS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
@@ -197,8 +203,10 @@ def main() -> None:
 
     if args.development_count < 0 or args.test_count < 0:
         parser.error("split counts must be non-negative")
-    if args.max_new_tokens < 0:
-        parser.error("--max-new-tokens must be non-negative")
+    if args.max_new_tokens <= 0:
+        parser.error("--max-new-tokens must be positive")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
     if args.temperature <= 0:
         parser.error("--temperature must be positive")
     if not 0 < args.top_p <= 1:
@@ -232,53 +240,71 @@ def main() -> None:
         development_path.open("w", encoding="utf-8") as development_file,
         test_path.open("w", encoding="utf-8") as test_file,
     ):
+        development_records: list[tuple[str, str, int]] = []
+        test_records: list[tuple[str, str, int]] = []
         for index, row in enumerate(selected):
             is_development = index < args.development_count
             dataset_name = "development" if is_development else "test"
             split_index = index if is_development else index - args.development_count
-            prompt_id = f"{dataset_name}-{split_index:04d}"
-            prompt = _render_prompt(row)
-            pair_seed = args.seed + index
-
-            torch.manual_seed(pair_seed)
-            normal_result = generate_normal(
-                model,
-                tokenizer,
-                prompt,
-                device=input_device,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
+            record = (
+                f"{dataset_name}-{split_index:04d}",
+                _render_prompt(row),
+                index,
             )
+            (development_records if is_development else test_records).append(record)
 
-            watermarked_result = None
-            if not is_development:
-                torch.manual_seed(pair_seed)
-                watermarked_result = generate_watermarked(
+        for records, output_file, is_test in (
+            (development_records, development_file, False),
+            (test_records, test_file, True),
+        ):
+            for batch_start in range(0, len(records), args.batch_size):
+                batch_records = records[batch_start : batch_start + args.batch_size]
+                prompts = [record[1] for record in batch_records]
+                batch_seed = args.seed + batch_records[0][2]
+
+                torch.manual_seed(batch_seed)
+                normal_results = generate_normal_batch(
                     model,
                     tokenizer,
-                    prompt,
-                    key,
+                    prompts,
                     device=input_device,
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_p=args.top_p,
-                    layers=args.layers,
                 )
 
-            output_file = development_file if is_development else test_file
-            rows = _generation_rows(
-                prompt_id=prompt_id,
-                normal_result=normal_result,
-                watermarked_result=watermarked_result,
-                model_name=args.model,
-                tokenizer_name=tokenizer_name,
-            )
+                watermarked_results: list[GenerationResult] = []
+                if is_test:
+                    torch.manual_seed(batch_seed)
+                    watermarked_results = generate_watermarked_batch(
+                        model,
+                        tokenizer,
+                        prompts,
+                        key,
+                        device=input_device,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        layers=args.layers,
+                    )
 
-            for generated_row in rows:
-                output_file.write(json.dumps(generated_row, ensure_ascii=False) + "\n")
-
-            print(f"[{index + 1}/{total_count}] generated {prompt_id}")
+                for local_index, (record, normal_result) in enumerate(
+                    zip(batch_records, normal_results, strict=True)
+                ):
+                    prompt_id, _, source_index = record
+                    watermarked_result = (
+                        watermarked_results[local_index] if is_test else None
+                    )
+                    rows = _generation_rows(
+                        prompt_id=prompt_id,
+                        normal_result=normal_result,
+                        watermarked_result=watermarked_result,
+                        model_name=args.model,
+                        tokenizer_name=tokenizer_name,
+                    )
+                    for generated_row in rows:
+                        output_file.write(json.dumps(generated_row, ensure_ascii=False) + "\n")
+                    print(f"[{source_index + 1}/{total_count}] generated {prompt_id}")
 
     print(f"Saved development data to {development_path}")
     print(f"Saved test data to {test_path}")

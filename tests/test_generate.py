@@ -66,6 +66,81 @@ class CacheModel:
         return SimpleNamespace(logits=logits, past_key_values=object())
 
 
+class NormalBatchModel:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def generate(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        self.calls.append(
+            {
+                "input_ids": input_ids.clone(),
+                "attention_mask": attention_mask.clone(),
+                "kwargs": kwargs,
+            }
+        )
+        generated = torch.tensor(
+            [[31, 32]] * input_ids.shape[0],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        return torch.cat((input_ids, generated), dim=1)
+
+
+def test_generate_normal_batch_preserves_order_and_batch_shape() -> None:
+    model = NormalBatchModel()
+    results = generate.generate_normal_batch(
+        model,
+        FakeTokenizer(),
+        ["short", "long"],
+        device=torch.device("cpu"),
+        max_new_tokens=2,
+        temperature=0.7,
+        top_p=0.8,
+    )
+
+    assert [result.generated_token_ids for result in results] == [[31, 32], [31, 32]]
+    assert model.calls[0]["input_ids"].tolist() == [[0, 11, 12], [21, 22, 23]]
+    assert model.calls[0]["attention_mask"].tolist() == [[0, 1, 1], [1, 1, 1]]
+    assert model.calls[0]["kwargs"] == {
+        "max_new_tokens": 2,
+        "do_sample": True,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "pad_token_id": 0,
+    }
+
+
+@pytest.mark.parametrize("max_new_tokens", [0, -1])
+def test_generate_normal_batch_requires_positive_max_tokens(max_new_tokens: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        generate.generate_normal_batch(
+            object(),
+            FakeTokenizer(),
+            ["prompt"],
+            device=torch.device("cpu"),
+            max_new_tokens=max_new_tokens,
+        )
+
+
+@pytest.mark.parametrize("max_new_tokens", [0, -1])
+def test_generate_watermarked_batch_requires_positive_max_tokens(max_new_tokens: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        generate.generate_watermarked_batch(
+            object(),
+            FakeTokenizer(),
+            ["prompt"],
+            bytes(range(32)),
+            device=torch.device("cpu"),
+            max_new_tokens=max_new_tokens,
+        )
+
+
 def test_generate_watermarked_reuses_cache_and_warper(monkeypatch: pytest.MonkeyPatch) -> None:
     model = CacheModel()
     tokenizer = FakeTokenizer()
