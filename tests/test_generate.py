@@ -11,14 +11,30 @@ from src import generate
 
 class FakeTokenizer:
     chat_template = None
-    eos_token_id = None
+    eos_token_id = 2
+    pad_token_id = 0
+    padding_side = "right"
 
-    def __call__(self, prompt: str, *, return_tensors: str) -> dict[str, torch.Tensor]:
-        del prompt
+    def __call__(
+        self,
+        prompt: str | list[str],
+        *,
+        return_tensors: str,
+        padding: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        del padding
         assert return_tensors == "pt"
+        prompts = [prompt] if isinstance(prompt, str) else prompt
+        token_rows = [
+            [11, 12] if value == "short" else [21, 22, 23] if value == "long" else [10, 11, 12]
+            for value in prompts
+        ]
+        width = max(len(row) for row in token_rows)
+        input_rows = [[0] * (width - len(row)) + row for row in token_rows]
+        mask_rows = [[0] * (width - len(row)) + [1] * len(row) for row in token_rows]
         return {
-            "input_ids": torch.tensor([[10, 11, 12]], dtype=torch.long),
-            "attention_mask": torch.ones((1, 3), dtype=torch.long),
+            "input_ids": torch.tensor(input_rows, dtype=torch.long),
+            "attention_mask": torch.tensor(mask_rows, dtype=torch.long),
         }
 
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
@@ -46,7 +62,7 @@ class CacheModel:
                 "past_key_values": past_key_values,
             }
         )
-        logits = torch.zeros((1, input_ids.shape[1], 32), dtype=torch.float32)
+        logits = torch.zeros((input_ids.shape[0], input_ids.shape[1], 32), dtype=torch.float32)
         return SimpleNamespace(logits=logits, past_key_values=object())
 
 
@@ -100,3 +116,35 @@ def test_generate_watermarked_requires_model_cache() -> None:
             device=torch.device("cpu"),
             max_new_tokens=1,
         )
+
+
+def test_generate_watermarked_batch_keeps_independent_row_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = CacheModel()
+    tokenizer = FakeTokenizer()
+    selected_tokens = iter([2, 5, 6, 2])
+
+    def choose_token(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        return next(selected_tokens)
+
+    monkeypatch.setattr(generate, "_select_next_token", choose_token)
+
+    results = generate.generate_watermarked_batch(
+        model,
+        tokenizer,
+        ["short", "long"],
+        bytes(range(32)),
+        device=torch.device("cpu"),
+        max_new_tokens=4,
+    )
+
+    assert [result.generated_token_ids for result in results] == [[2], [5, 6, 2]]
+    assert [call["input_ids"].tolist() for call in model.calls] == [
+        [[0, 11, 12], [21, 22, 23]],
+        [[2], [5]],
+        [[0], [6]],
+    ]
+    assert [call["attention_mask"].shape[1] for call in model.calls] == [3, 4, 5]
+    assert tokenizer.padding_side == "right"
