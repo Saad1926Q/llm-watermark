@@ -149,6 +149,7 @@ def generate_normal_batch(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=True,
+            logits_to_keep=1,
         )
         past_key_values = getattr(outputs, "past_key_values", None)
         if past_key_values is None:
@@ -194,6 +195,7 @@ def generate_normal_batch(
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=True,
+                logits_to_keep=1,
             )
             past_key_values = getattr(outputs, "past_key_values", None)
             if past_key_values is None:
@@ -339,6 +341,7 @@ def generate_watermarked_batch(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=True,
+            logits_to_keep=1,
         )
         past_key_values = getattr(outputs, "past_key_values", None)
 
@@ -391,6 +394,7 @@ def generate_watermarked_batch(
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=True,
+                logits_to_keep=1,
             )
             past_key_values = getattr(outputs, "past_key_values", None)
             if past_key_values is None:

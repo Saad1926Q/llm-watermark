@@ -52,6 +52,7 @@ class CacheModel:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         use_cache: bool,
+        logits_to_keep: int,
         past_key_values: object | None = None,
     ) -> SimpleNamespace:
         self.calls.append(
@@ -60,9 +61,10 @@ class CacheModel:
                 "attention_mask": attention_mask.clone(),
                 "use_cache": use_cache,
                 "past_key_values": past_key_values,
+                "logits_to_keep": logits_to_keep,
             }
         )
-        logits = torch.zeros((input_ids.shape[0], input_ids.shape[1], 32), dtype=torch.float32)
+        logits = torch.zeros((input_ids.shape[0], logits_to_keep, 32), dtype=torch.float32)
         return SimpleNamespace(logits=logits, past_key_values=object())
 
 
@@ -73,12 +75,14 @@ class NormalCacheModel(CacheModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         use_cache: bool,
+        logits_to_keep: int,
         past_key_values: object | None = None,
     ) -> SimpleNamespace:
         output = super().__call__(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
             past_key_values=past_key_values,
         )
         output.logits.fill_(-torch.inf)
@@ -110,6 +114,7 @@ def test_generate_normal_batch_preserves_order_and_batch_shape() -> None:
         [[0, 1, 1, 1], [1, 1, 1, 1]],
     ]
     assert all(call["use_cache"] is True for call in model.calls)
+    assert all(call["logits_to_keep"] == 1 for call in model.calls)
 
 
 @pytest.mark.parametrize("max_new_tokens", [0, -1])
