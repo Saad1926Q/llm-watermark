@@ -113,9 +113,11 @@ responses:
 ```bash
 uv run python -m scripts.generate_data \
     --model Qwen/Qwen3-14B-FP8 \
+    --dataset sentence-transformers/eli5 \
+    --dataset-config pair \
     --development-count 1200 \
     --test-count 400 \
-    --max-new-tokens 1024 \
+    --max-new-tokens 512 \
     --temperature 0.7 \
     --top-p 0.8 \
     --device-map auto \
@@ -134,6 +136,10 @@ uv run python -m scripts.evaluate \
     --predictions-output outputs/calibration/test-predictions.jsonl \
     --metrics-output outputs/calibration/test-metrics.json
 ```
+
+The default dataset is the `pair` configuration of
+`sentence-transformers/eli5`. Its `question` field is used as the prompt; the
+reference `answer` is not passed to the model.
 
 `generate_data` writes two files. Development prompts produce one ordinary
 row each. Test prompts produce one ordinary and one watermarked row each:

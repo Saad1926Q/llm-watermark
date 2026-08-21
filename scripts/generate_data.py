@@ -18,30 +18,27 @@ from src.generate import (
 from src.watermark import DEFAULT_KEY_PATH, TOURNAMENT_LAYERS, load_key
 
 DEFAULT_SEED = 42
-DEFAULT_DATASET = "databricks/databricks-dolly-15k"
+DEFAULT_DATASET = "sentence-transformers/eli5"
+DEFAULT_DATASET_CONFIG = "pair"
 DEFAULT_OUTPUT_DIR = Path("data/calibration")
 
 
 def _render_prompt(row: dict[str, Any]) -> str:
-    """Render a dataset instruction and optional context into a prompt.
+    """Return the ELI5 question used as the model prompt.
 
     Args:
-        row: Dataset row containing ``instruction`` and optional ``context``.
+        row: ELI5 pair row containing a ``question``.
 
     Returns:
-        The text prompt passed to the language model.
+        The stripped ELI5 question.
 
     Raises:
-        ValueError: If the row has no non-empty instruction.
+        ValueError: If the row has no non-empty question.
     """
-    instruction = str(row.get("instruction", "")).strip()
-    if not instruction:
-        raise ValueError("Dataset row is missing a non-empty instruction")
-
-    context = str(row.get("context", "")).strip()
-    if context:
-        return f"{instruction}\n\nContext:\n{context}"
-    return instruction
+    question = str(row.get("question", "")).strip()
+    if not question:
+        raise ValueError("ELI5 dataset row is missing a non-empty question")
+    return question
 
 
 def _load_model(
@@ -165,6 +162,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True, help="Hugging Face causal LM name or path")
     parser.add_argument("--key", type=Path, default=DEFAULT_KEY_PATH)
     parser.add_argument("--dataset", default=DEFAULT_DATASET, help="Hugging Face dataset name")
+    parser.add_argument(
+        "--dataset-config",
+        default=DEFAULT_DATASET_CONFIG,
+        help="Hugging Face dataset configuration name",
+    )
     parser.add_argument("--dataset-split", default="train")
     parser.add_argument(
         "--development-count",
@@ -234,7 +236,11 @@ def main() -> None:
         device_map=args.device_map,
     )
 
-    dataset = load_dataset(args.dataset, split=args.dataset_split)
+    dataset = load_dataset(
+        args.dataset,
+        args.dataset_config,
+        split=args.dataset_split,
+    )
     total_count = args.development_count + args.test_count
     if total_count > len(dataset):
         raise ValueError(f"requested {total_count} rows but dataset has only {len(dataset)}")

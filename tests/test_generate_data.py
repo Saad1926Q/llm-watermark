@@ -1,7 +1,27 @@
 from __future__ import annotations
 
-from scripts.generate_data import _build_parser, _generation_row, _generation_rows
+import pytest
+
+from scripts.generate_data import (
+    DEFAULT_DATASET,
+    DEFAULT_DATASET_CONFIG,
+    _build_parser,
+    _generation_row,
+    _generation_rows,
+    _render_prompt,
+)
 from src.generate import GenerationResult
+
+
+def test_render_prompt_uses_eli5_question() -> None:
+    assert _render_prompt({"question": "  Why is the sky blue?  ", "answer": "..."}) == (
+        "Why is the sky blue?"
+    )
+
+
+def test_render_prompt_rejects_missing_eli5_question() -> None:
+    with pytest.raises(ValueError, match="non-empty question"):
+        _render_prompt({"answer": "No question"})
 
 
 def test_generation_row_contains_only_scoring_metadata() -> None:
@@ -52,4 +72,7 @@ def test_generation_parser_exposes_batch_size() -> None:
     parser = _build_parser()
 
     assert parser.parse_args(["--model", "test-model"]).batch_size == 1
+    defaults = parser.parse_args(["--model", "test-model"])
+    assert defaults.dataset == DEFAULT_DATASET
+    assert defaults.dataset_config == DEFAULT_DATASET_CONFIG
     assert parser.parse_args(["--model", "test-model", "--batch-size", "4"]).batch_size == 4
