@@ -1,170 +1,262 @@
-# Minimal SynthID-Text Watermark
+<h1 align="center">llm-watermark</h1>
 
-A minimal, educational implementation of the published SynthID-Text watermarking baseline for Hugging Face causal language models.
+<p align="center">
+A minimal, educational implementation of SynthID-Text-style watermarking for language models
+</p>
 
-This project is inspired by Anthropic's article, [How Claude’s text watermark works](https://www.anthropic.com/news/claude-text-watermark), which explains that future Claude models will use a version of Google DeepMind's SynthID-Text approach. Anthropic has not published Claude's exact production implementation, key, or detector; this repository instead follows the public [SynthID-Text paper](https://www.nature.com/articles/s41586-024-08025-4).
+---
 
-The goal is to show the complete watermarking flow with as little code and as few dependencies as possible:
+## Motivation
 
-Generation and ordinary detection use `torch` and `transformers`. The paired
-calibration generator additionally uses `datasets`; `accelerate` is
-needed when using Transformers automatic device placement.
+Recently, Anthropic [announced](https://www.anthropic.com/news/claude-text-watermark) that future Claude models will use text watermarking. I was curious about what that meant. Would model responses contain visible markers, strange phrases, or something like an ad saying, “By the way, buy our Max plan”?
 
-1. Generate and save a secret watermark key.
-2. Embed a statistical watermark during token sampling.
-3. Detect the watermark using the same key and tokenizer.
+It turns out that the watermark is not a visible message at all. It is a subtle statistical pattern introduced while the model chooses its tokens. The response should still read normally, but someone with the secret watermark key can examine enough of its tokens and look for that pattern.
 
-## Working
+Anthropic has not published Claude’s exact production implementation, detector, or key. Its article points to Google DeepMind’s [SynthID-Text](https://www.nature.com/articles/s41586-024-08025-4) approach, so I built this project to understand the public algorithm at a lower level.
 
-### Generation
+> **Note:** This is an educational implementation, not a replica of Claude’s private watermarking system or Google’s production SynthID infrastructure. It implements the central published idea - keyed Tournament sampling, mean-bit detection, and empirical threshold calibration in a deliberately small codebase. Some components are simplified or implemented differently from the original SynthID-Text paper, so the results and implementation details should not be treated as an exact reproduction of the published system. These differences are identified where relevant below.
 
-At each step, the watermark uses:
+## What This Repo Is About
 
-- a secret 32-byte key;
-- the previous four token IDs as context;
-- three tournament layers by default, which means eight sampled candidates.
+In this repository, I have tried to understand the complete workflow behind watermarking LLM responses and how each part works. This includes:
 
-1. The model produces next-token logits for the current context.
-2. Temperature and top-p filtering produce the normal sampling distribution.
-3. Eight candidate tokens are sampled from that distribution.
-4. For each candidate and tournament layer, a keyed hash of the key, four-token context, layer, and candidate token produces a deterministic bit.
-5. Candidates compete in a tournament that statistically favors higher-scoring tokens.
-6. The winning token is appended and becomes part of the context for the next step.
+- how a model response is generated with a watermark.
+- how to detect whether a model response contains that watermark.
+- how to test how well the watermarking and detection process works.
 
-### Normal vs. watermarked sampling
+The watermark changes only the sampling stage. It does not retrain the model, alter its weights, insert fixed phrases, or add hidden Unicode characters.
 
-Normal stochastic sampling:
+## The Core Idea
+
+Normal stochastic generation samples one token from the model’s next-token distribution:
 
 ```text
-current context
-    ↓
-model logits
-    ↓
-temperature/top-p filtering
-    ↓
-sample one token from the probabilities
+context → model probabilities → sample one token
 ```
 
-Watermarked generation:
+Watermarked generation samples several valid candidates from that same distribution and lets them compete in a secret, context-dependent tournament:
 
 ```text
-current context
-    ↓
-model logits
-    ↓
-temperature/top-p filtering
-    ↓
-sample several candidate tokens
-    ↓
-keyed tournament
-    ↓
-choose one candidate
+context → model probabilities → sample candidates
+        → keyed tournament → choose one winner
 ```
 
-The main difference is:
+Every candidate still comes from the model’s normal distribution. The tournament only introduces a small preference for candidates that score well under a secret keyed function. One token reveals almost nothing, but the preference becomes measurable across a longer response.
+
+### Normal generation
+
+![Normal generation workflow](images/normal_generation.png)
+
+### Watermarked generation
+
+![Watermarked generation workflow](images/watermarked_generation.png)
+
+The same keyed BLAKE2b calculation is used during generation and detection. Generation uses it to influence which candidate wins; detection uses it to check whether the observed tokens won unusually often under those keyed scores.
+
+## Watermark Generation
+
+### 1. Produce the next-token distribution
+
+**In the paper:** The language model reads the preceding text and assigns a probability to every possible next token.
+
+**In this implementation:** The Hugging Face model produces next-token logits. We apply the configured temperature and top-p filtering, then convert the filtered logits into probabilities.
+
+### 2. Build a context-dependent watermark value
+
+**In the paper:** At each generation step, a sliding-window seed generator hashes the secret key together with the previous four tokens to produce a pseudorandom seed, called `r_t`. The same context and key always reproduce the same `r_t`, which allows the detector to reconstruct it later. The paper then passes `r_t` to a separate pseudorandom watermark function for each tournament layer, called `g_1`, `g_2`, and so on. Each `g` function takes `r_t` and a candidate token and assigns that candidate a score for its layer. In the paper’s binary example, that score is either `0` or `1`.
+
+**In this implementation:** For simplicity, instead of first generating a pseudorandom seed from the previous response tokens and then passing that seed to a separate layer-specific `g` function, we perform one keyed BLAKE2b calculation directly. For every candidate token at every tournament layer, we hash a payload containing the four previous response-token IDs, the layer number, and the candidate token ID, using the 32-byte watermark key as BLAKE2b’s secret key. The lowest bit of the digest becomes the candidate’s binary score, `0` or `1`. This single operation therefore replaces the combined role of the paper’s seed generator and `g` function; it is not an exact implementation of the paper’s internal pseudorandom functions. It preserves the properties needed here: the score varies with the response context, each layer has a distinct scoring function, and different candidate tokens can receive different scores. Because the calculation is deterministic, the detector can later reproduce the same bit from the generated text and key.
+
+### 3. Sample the tournament candidates
+
+**In the paper:** An `m`-layer binary tournament starts with `2^m` candidates sampled from the language-model distribution. Sampling uses replacement, so the same token may appear more than once.
+
+**In this implementation:** We sample exactly `2^layers` candidates with `torch.multinomial(..., replacement=True)`. Four layers use 16 candidates, eight layers use 256, and twelve layers use 4,096.
+
+### 4. Run the tournament
+
+**In the paper:** Candidates compete in pairs. The candidate with the higher watermark value survives; ties are broken randomly. Winners are randomly regrouped and evaluated by the next watermark function until one candidate remains.
+
+**In this implementation:** Every match has two competitors. We calculate both keyed bits, keep the higher-scoring candidate, and use a random bit to resolve ties. Later rounds randomly permute the remaining candidates before pairing them again.
+
+For a four-layer run:
 
 ```text
-normal sampling:
-    probability distribution → sample one token
-
-watermarked sampling:
-    probability distribution → sample several tokens
-    → use the key to select a statistically favorable candidate
+16 candidates → 8 winners → 4 winners → 2 winners → 1 output token
 ```
 
-### Detection
+The following three-layer example shows the tournament structure with generic candidate names. The displayed bits are only illustrative:
 
-1. Tokenize the text with the same tokenizer used for generation.
-2. Recompute the keyed watermark bits for each token and its preceding
-   context.
-3. For calibrated scoring, keep the first configured number of
-   response-text tokens and reject shorter responses.
-4. Skip later occurrences of a four-token context that has already been
-   scored in the response.
-5. Aggregate the remaining bits into a raw watermark score and report the
-   number of unique scored contexts.
+![Tournament sampling workflow](images/tournament_sampling.png)
 
-Detection only needs the text, tokenizer, key, and watermark configuration - not the language model. A correct key should produce an elevated score for watermarked text, while ordinary text or a wrong key should remain near the random baseline.
+### 5. Append the winner and repeat
 
-Raw scores are evidence, not a classification decision. Classification requires
-a saved calibration JSON artifact whose metadata matches the detector
-configuration; a missing or incompatible artifact is an error rather than an
-uncalibrated fallback.
+**In the paper:** The final tournament winner becomes the next token. It is appended to the context, and generation continues until an end token or maximum length is reached.
 
-This repository is educational and non-production. It does not claim to
-reproduce any private production watermark implementation or provide
-production-grade calibration guarantees.
+**In this implementation:** The winner is appended to the response and passed back to the model. We reuse the model’s attention cache instead of recomputing the complete sequence at every step. Generation stops at the tokenizer’s end token or `max_new_tokens`.
 
-## Command-line tools
+### 6. Mask repeated contexts
 
-Generate the default 256-bit key at `keys/watermark.key`:
+**In the paper:** Repeated-context masking is used for a stronger sequence-level non-distortion property. Reusing a context would otherwise reuse the same watermark decision.
+
+**In this implementation:** If the same four-token response context appears again, its later occurrence is sampled normally rather than watermarked. Detection skips those repeated contexts as well.
+
+The first four response tokens are also sampled normally because a complete four-token response context does not exist yet. Prompt tokens are not used as watermark context in this implementation.
+
+## Watermark Detection
+
+Detection does not need the language model. It needs only:
+
+- the response text;
+- the same tokenizer;
+- the secret key;
+- the number of tournament layers;
+- the calibrated token-length and threshold configuration.
+
+![Watermark detection workflow](images/watermark_detection.png)
+
+The detector works as follows:
+
+1. **Tokenize the response.** No prompt or special tokens are added.
+2. **Use a fixed prefix.** The default calibration requires the first 200 response tokens. Shorter responses are marked insufficient rather than classified.
+3. **Reconstruct each context.** Starting after the first four tokens, take the preceding four-token window.
+4. **Skip repeated contexts.** Only the first occurrence contributes evidence, matching generation.
+5. **Recompute the keyed bits.** For the observed token, calculate one bit for every tournament layer.
+6. **Average the evidence.** The raw score is the number of `1` bits divided by the total number of scored bits.
+7. **Apply the calibrated threshold.** Scores at or above the threshold are classified as watermarked.
+
+Ordinary text has no relationship with the secret key, so its bits should behave roughly like random values. Tournament sampling favors higher-scoring candidates, so watermarked text should produce a higher average over enough tokens.
+
+A raw score alone is not a reliable yes/no answer. Text length, tokenizer, model distribution, decoding settings, layer count, and key all affect the score distribution. That is why this repository requires calibration instead of shipping a guessed threshold.
+
+## Calibration and Evaluation
+
+The experiment keeps threshold fitting separate from final evaluation so that the test set does not influence the decision rule.
+
+### 1. Generate the development data
+
+Each development prompt produces one ordinary, unwatermarked response. These responses are negative controls: they show how high the keyed score can become by chance.
+
+### 2. Generate the held-out test data
+
+Each test prompt produces a pair:
+
+- one ordinary response;
+- one watermarked response.
+
+This gives held-out negative and positive examples for measuring the detector.
+
+### 3. Score a fixed token prefix
+
+Calibration tokenizes each development response and scores exactly the configured prefix, which is 200 tokens in the experiments below. Responses shorter than that prefix are excluded as insufficient.
+
+Using a fixed prefix makes scores comparable. Otherwise, longer responses would contain more evidence than shorter responses.
+
+### 4. Fit the threshold
+
+Only ordinary development responses are used. Their scores are sorted, and the smallest observed threshold satisfying the requested false-positive-rate budget is selected. The experiments use a target development FPR of 1%.
+
+The saved calibration artifact records the threshold together with the model, tokenizer, key fingerprint, layer count, required token count, and observed development FPR. Detection rejects a mismatched key rather than silently applying incompatible calibration.
+
+### 5. Freeze and evaluate
+
+The fitted threshold is applied unchanged to the held-out test pairs. Evaluation reports:
+
+- **FPR:** the fraction of sufficient ordinary responses incorrectly classified as watermarked;
+- **TPR:** the fraction of sufficient watermarked responses correctly detected;
+- **insufficient rows:** responses that did not reach the required 200-token prefix.
+
+## Experiments
+
+I ran a layer-count comparison on ELI5 responses generated by LFM2.5-2.6B.
+
+### Generation parameters
+
+```text
+model:              LiquidAI/LFM2.5-2.6B
+dataset:            sentence-transformers/eli5
+dataset config:     pair
+dataset split:      train
+development count:  4000 prompts
+test count:         1000 prompts
+max new tokens:     512
+temperature:        0.7
+top-p:              0.8
+batch size:         64
+device map:         auto
+seed:               2026
+key path:           keys/watermark.key
+required tokens:    200
+target FPR:         0.01
+```
+
+Each development prompt generated one ordinary response. Each test prompt generated one ordinary and one watermarked response, giving 2,000 test rows per run before insufficient responses were excluded from FPR and TPR.
+
+### Results
+
+| Tournament layers | Initial candidates | Threshold | Test FPR | Test TPR | Insufficient rows |
+| ----------------: | -----------------: | --------: | -------: | -------: | ----------------: |
+|                 4 |                 16 |    0.5438 |     0.5% |   34.33% |                 1 |
+|                 8 |                256 |    0.5324 |     0.8% |   42.38% |                 2 |
+|                12 |              4,096 |    0.5265 |     0.5% |   48.45% |                 1 |
+
+In these runs, increasing the layer count improved held-out detection at roughly the same false-positive level. The cost rises quickly, however, because a binary `m`-layer tournament samples `2^m` candidates and evaluates a larger tournament for every generated token.
+The generated ordinary and watermarked responses are available in the [Hugging Face dataset](https://huggingface.co/datasets/saad1926q/llm-watermark).
+
+
+
+## Running the Project
+
+This project requires Python 3.13 or newer and uses [uv](https://docs.astral.sh/uv/).
+
+Generate a new 256-bit watermark key:
 
 ```bash
 uv run python -m scripts.generate_key
 ```
 
-## Calibrated test-set evaluation
-
-Raw scores are not calibrated thresholds. Generate separate development and
-test JSONL files, fit the threshold using only ordinary development responses,
-then evaluate the frozen artifact on held-out ordinary and watermarked test
-responses:
+Generate ordinary development responses and paired ordinary/watermarked test responses:
 
 ```bash
 uv run python -m scripts.generate_data \
-    --model Qwen/Qwen3-14B-FP8 \
+    --model LiquidAI/LFM2.5-2.6B \
     --dataset sentence-transformers/eli5 \
     --dataset-config pair \
-    --development-count 1200 \
-    --test-count 400 \
+    --dataset-split train \
+    --development-count 4000 \
+    --test-count 1000 \
     --max-new-tokens 512 \
     --temperature 0.7 \
     --top-p 0.8 \
+    --batch-size 64 \
+    --layers 4 \
+    --seed 2026 \
     --device-map auto \
-    --batch-size 4 \
-    --output-dir outputs/calibration
+    --output-dir outputs/eli5-lfm2.5-2.6b-layers-4
+```
 
+Fit a threshold using only the ordinary development responses:
+
+```bash
 uv run python -m scripts.fit_threshold \
-    --development outputs/calibration/development.jsonl \
-    --output outputs/calibration/calibration.json \
+    --development outputs/eli5-lfm2.5-2.6b-layers-4/development.jsonl \
+    --output outputs/eli5-lfm2.5-2.6b-layers-4/calibration.json \
     --required-tokens 200 \
-    --target-fpr 0.01
+    --target-fpr 0.01 \
+    --layers 4
+```
 
+Evaluate the frozen threshold on the held-out test pairs:
+
+```bash
 uv run python -m scripts.evaluate \
-    --test outputs/calibration/test.jsonl \
-    --calibration outputs/calibration/calibration.json \
-    --predictions-output outputs/calibration/test-predictions.jsonl \
-    --metrics-output outputs/calibration/test-metrics.json
+    --test outputs/eli5-lfm2.5-2.6b-layers-4/test.jsonl \
+    --calibration outputs/eli5-lfm2.5-2.6b-layers-4/calibration.json \
+    --predictions-output outputs/eli5-lfm2.5-2.6b-layers-4/predictions.jsonl \
+    --metrics-output outputs/eli5-lfm2.5-2.6b-layers-4/metrics.json
 ```
 
-The default dataset is the `pair` configuration of
-`sentence-transformers/eli5`. Its `question` field is used as the prompt; the
-reference `answer` is not passed to the model.
+## References
 
-`generate_data` writes two files. Development prompts produce one ordinary
-row each. Test prompts produce one ordinary and one watermarked row each:
-
-`--batch-size` controls how many prompts are generated in one model batch;
-use `1` to disable batching when memory is limited.
-
-```text
-outputs/calibration/development.jsonl  # development-count rows
-outputs/calibration/test.jsonl         # 2 × test-count rows
-```
-
-`fit_threshold` uses only rows with `kind: "unwatermarked"` from the
-development file to choose the upper-tail threshold. It tokenizes each row's
-`text` using the declared tokenizer, then scores exactly the first 200
-tokenized response tokens; shorter responses are insufficient.
-
-`evaluate` loads the frozen threshold and applies it to every labeled test row.
-It writes one prediction JSON object per input row, preserving the original
-row fields and adding the row number, score, predicted kind, correctness, and
-token-count details. It also reports aggregate test FPR and TPR.
-
-Calibration rows store response text rather than generated token IDs. Fitting
-and evaluation tokenize that text with the calibration tokenizer, so both
-stages use the same text-to-token pipeline. The calibration artifact stores
-the fitted threshold, key fingerprint, model, tokenizer, tournament layers,
-and required response-token prefix length.
-
+- [Scalable watermarking for identifying large language model outputs](https://www.nature.com/articles/s41586-024-08025-4)
+- [How Claude’s text watermark works](https://www.anthropic.com/news/claude-text-watermark)
